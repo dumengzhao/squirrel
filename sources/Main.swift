@@ -22,8 +22,6 @@ struct SquirrelApp {
 
   // swiftlint:disable:next cyclomatic_complexity
   static func main() {
-    let rimeAPI: RimeApi_stdbool = rime_get_api_stdbool().pointee
-
     let handled = autoreleasepool {
       let installer = SquirrelInstaller()
       let args = CommandLine.arguments
@@ -71,11 +69,14 @@ struct SquirrelApp {
           return true
         case "--build":
           SquirrelApplicationDelegate.showMessage(msgText: NSLocalizedString("deploy_update", comment: ""))
-          var builderTraits = RimeTraits.rimeStructInit()
-          builderTraits.setCString("rime.squirrel-builder", to: \.app_name)
-          rimeAPI.setup(&builderTraits)
-          rimeAPI.deployer_initialize(nil)
-          _ = rimeAPI.deploy()
+          // heng_create 内部完成完整部署；以当前目录为用户数据目录对齐原 --build 语义
+          let cwd = FileManager.default.currentDirectoryPath
+          let rc = cwd.withCString { heng_create(nil, $0) }
+          if rc != 0 {
+            let message = heng_last_error().map { String(cString: $0) } ?? "(no error message)"
+            print("heng_create failed: \(message)")
+          }
+          heng_destroy()
           return true
         case "--sync":
           DistributedNotificationCenter.default().postNotificationName(.init("SquirrelSyncNotification"), object: nil, userInfo: nil, deliverImmediately: true)
@@ -154,7 +155,7 @@ struct SquirrelApp {
 
       app.run()
       print("Squirrel is quitting...")
-      rimeAPI.finalize()
+      heng_destroy()
     }
     return
   }

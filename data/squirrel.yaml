@@ -25,13 +25,12 @@ status_icon:
   show: true
 
 style:
-  color_scheme: native
-  # Optional: define both light and dark color schemes to match system appearance
-  #color_scheme: solarized_light
-  #color_scheme_dark: solarized_dark
+  color_scheme: heng_blue
+  color_scheme_dark: heng_blue
+  color_space: srgb
 
-  # horizontal is Deprecated since 0.36, Squirrel 0.15, removed since 1.0.1
-  candidate_list_layout: stacked  # stacked | linear
+  # 与 Windows 端 heng_blue 视觉对齐：横排候选、圆角 8、14pt
+  candidate_list_layout: linear  # stacked | linear
   text_orientation: horizontal  # horizontal | vertical
   inline_preedit: true
   # Whether to embed selected candidate as text in input field
@@ -45,8 +44,8 @@ style:
   # Enable to show small arrows that indicates if paging up/down is possible
   show_paging: false
 
-  corner_radius: 7
-  hilited_corner_radius: 0
+  corner_radius: 8
+  hilited_corner_radius: 8
   border_height: -2
   border_width: -2
   # Space between candidates in stacked layout
@@ -66,8 +65,8 @@ style:
 
   # adjust the base line of text
   #base_offset: 0
-  font_face: 'Avenir'
-  font_point: 16
+  font_face: 'PingFangSC-Regular'
+  font_point: 14
   #label_font_face: 'Avenir'
   #label_font_point: 12
   #comment_font_face: 'Avenir'
@@ -440,3 +439,31 @@ app_options:
   ru.keepcoder.Telegram:
     # 規避 https://github.com/rime/squirrel/issues/475
     inline: true
+
+# HengIME：与 Windows 端 weasel.yaml 同源的统一配色（U6 样式统一，M-P4）
+preset_color_schemes:
+  heng_blue:
+    name: "衡／Heng Blue"
+    author: HengIME
+    color_format: argb
+    back_color: 0xFFFFFFFF
+    border_color: 0x00000000
+    shadow_color: 0x2E000000
+    text_color: 0xFF000000
+    hilited_text_color: 0xFF000000
+    hilited_back_color: 0xFFE8EAED
+    candidate_text_color: 0xFF000000
+    candidate_back_color: 0x00000000
+    candidate_shadow_color: 0x00000000
+    candidate_border_color: 0x00000000
+    label_color: 0xFF9C9C9C
+    comment_text_color: 0xFFB0B0B0
+    hilited_candidate_text_color: 0xFFFFFFFF
+    hilited_candidate_back_color: 0xFF4F7CFE
+    hilited_candidate_shadow_color: 0x00000000
+    hilited_candidate_border_color: 0x00000000
+    hilited_label_color: 0xFFFFFFFF
+    hilited_comment_text_color: 0xFFFFFFFF
+    hilited_mark_color: 0x00000000
+    prevpage_color: 0x00000000
+    nextpage_color: 0x00000000

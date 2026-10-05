@@ -4,6 +4,10 @@
 //
 //  Created by Leo Liu on 5/7/24.
 //
+//  HengIME 换血：数据源从 librime rime_api 换为 heng_core C ABI。
+//  外壳职责保持不变：按键转发 + 候选窗渲染 + 会话生命周期挂钩；
+//  app_options / 开关传播 / 跨重启记忆由 core v6+ 行为统一层接管。
+//
 
 import InputMethodKit
 
@@ -12,7 +16,6 @@ final class SquirrelInputController: IMKInputController {
   private static var unknownAppCnt: UInt = 0
 
   private weak var client: IMKTextInput?
-  private let rimeAPI: RimeApi_stdbool = rime_get_api_stdbool().pointee
   private var preedit: String = ""
   private var selRange: NSRange = .empty
   private var caretPos: Int = 0
@@ -37,7 +40,7 @@ final class SquirrelInputController: IMKInputController {
     // Return true to consume the key event; return false to pass it to the client app.
     var handled = false
 
-    if session == 0 || !rimeAPI.find_session(session) {
+    if session == 0 {
       createSession()
       if session == 0 {
         return false
@@ -109,7 +112,7 @@ final class SquirrelInputController: IMKInputController {
         let rimeKeycode = SquirrelKeycode.osxKeycodeToRime(keycode: keyCode, keychar: char,
                                                            shift: modifiers.contains(.shift),
                                                            caps: modifiers.contains(.capsLock))
-        if rimeKeycode != 0 {
+          if rimeKeycode != 0 {
           let rimeModifiers = SquirrelKeycode.osxModifiersToRime(modifiers: modifiers)
           handled = processKey(rimeKeycode, modifiers: rimeModifiers)
           rimeUpdate()
@@ -124,7 +127,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   func selectCandidate(_ index: Int) -> Bool {
-    let success = rimeAPI.select_candidate_on_current_page(session, index)
+    let success = heng_select_candidate_on_current_page(session, Int32(index)) != 0
     if success {
       rimeUpdate()
     }
@@ -134,7 +137,7 @@ final class SquirrelInputController: IMKInputController {
   // swiftlint:disable:next identifier_name
   func page(up: Bool) -> Bool {
     var handled = false
-    handled = rimeAPI.change_page(session, up)
+    handled = heng_change_page(session, up ? 1 : 0) != 0
     if handled {
       rimeUpdate()
     }
@@ -142,19 +145,18 @@ final class SquirrelInputController: IMKInputController {
   }
 
   func moveCaret(forward: Bool) -> Bool {
-    let currentCaretPos = rimeAPI.get_caret_pos(session)
-    guard let input = rimeAPI.get_input(session) else { return false }
+    let currentCaretPos = Int(heng_get_caret_pos(session))
+    guard let input = hengGetInput(session) else { return false }
     if forward {
       if currentCaretPos <= 0 {
         return false
       }
-      rimeAPI.set_caret_pos(session, currentCaretPos - 1)
+      heng_set_caret_pos(session, Int32(currentCaretPos - 1))
     } else {
-      let inputStr = String(cString: input)
-      if currentCaretPos >= inputStr.utf8.count {
+      if currentCaretPos >= input.utf8.count {
         return false
       }
-      rimeAPI.set_caret_pos(session, currentCaretPos + 1)
+      heng_set_caret_pos(session, Int32(currentCaretPos + 1))
     }
     rimeUpdate()
     return true
@@ -162,6 +164,26 @@ final class SquirrelInputController: IMKInputController {
 
   override func recognizedEvents(_ sender: Any!) -> Int {
     return Int(NSEvent.EventTypeMask.Element(arrayLiteral: .keyDown, .flagsChanged).rawValue)
+  }
+
+  // 方向键不走 handle(event)：client 把它们绑定为 NSResponder action（moveLeft: 等）
+  // 经 didCommandBySelector:client: 路由。与 Windows 端统一：转交 core，由 key_binder
+  // （Left→Up / Right→Down，when: has_menu）实现候选高亮切换；core 不消费时回退默认
+  // （无候选时左右键仍为光标编辑，与 Windows 端语义一致）。
+  override func didCommand(by aSelector: Selector, client sender: Any!) -> Bool {
+    let arrows: [String: UInt32] = [
+      "moveLeft:": UInt32(XK_Left),
+      "moveRight:": UInt32(XK_Right),
+      "moveUp:": UInt32(XK_Up),
+      "moveDown:": UInt32(XK_Down)
+    ]
+    if let rimeKeycode = arrows[aSelector.description], session != 0 {
+      if processKey(rimeKeycode, modifiers: 0) {
+        rimeUpdate()
+        return true
+      }
+    }
+    return super.didCommand(by: aSelector, client: sender)
   }
 
   override func activateServer(_ sender: Any!) {
@@ -190,8 +212,8 @@ final class SquirrelInputController: IMKInputController {
     }
     preedit = ""
     if session != 0 {
-      let state = rimeAPI.get_option(session, "ascii_mode")
-      let label = rimeAPI.get_state_label_abbreviated(session, "ascii_mode", state, true).asString
+      let state = hengGetOption(session, "ascii_mode")
+      let label = hengStateLabel(session, "ascii_mode", state, abbreviated: true)
       NSApp.squirrelAppDelegate.updateStatusIcon(asciiMode: state, schemaLabel: label)
     }
   }
@@ -232,9 +254,9 @@ final class SquirrelInputController: IMKInputController {
   override func commitComposition(_ sender: Any!) {
     self.client ?= sender as? IMKTextInput
     if session != 0 {
-      if let input = rimeAPI.get_input(session) {
-        commit(string: String(cString: input))
-        rimeAPI.clear_composition(session)
+      if let input = hengGetInput(session) {
+        commit(string: input)
+        heng_clear(session)
       }
     }
   }
@@ -292,7 +314,7 @@ final class SquirrelInputController: IMKInputController {
   private(set) var specialCommentIndices: [ReservedPropertyKey: Set<Int>] = [:]
 
   func handleReservedProperty(key rawKey: String, value rawValue: String, for sessionId: RimeSessionId) throws(ReservedPropertyError) {
-    guard session == sessionId, session != 0, rimeAPI.find_session(session) else { return }
+    guard session == sessionId, session != 0 else { return }
     guard let key = ReservedPropertyKey(rawValue: rawKey) else { throw .unknownInput(rawKey) }
     let parsed = try ReservedPropertyValue.parse(rawValue)
     switch key {
@@ -317,7 +339,7 @@ private extension SquirrelInputController {
     if chordKeyCount > 0 && session != 0 {
       // Chord typing releases are synthesized after the configured timeout.
       for i in 0..<chordKeyCount {
-        let handled = rimeAPI.process_key(session, Int32(chordKeyCodes[i]), Int32(chordModifiers[i] | kReleaseMask.rawValue))
+        let handled = heng_process_key(session, Int32(chordKeyCodes[i]), Int32(chordModifiers[i] | kReleaseMask.rawValue)) != 0
         if handled {
           processedKeys = true
         }
@@ -366,7 +388,7 @@ private extension SquirrelInputController {
     }()
     print("createSession: \(app)")
     currentApp = app
-    session = rimeAPI.create_session()
+    session = app.withCString { heng_start_session($0) }
     schemaId = ""
 
     if session != 0 {
@@ -378,44 +400,30 @@ private extension SquirrelInputController {
     if currentApp == "" {
       return
     }
-    if let appOptions = NSApp.squirrelAppDelegate.config?.getAppOptions(currentApp) {
-      for (key, value) in appOptions {
-        print("set app option: \(key) = \(value)")
-        rimeAPI.set_option(session, key, value)
-      }
-    }
-    if let reportBundleID = NSApp.squirrelAppDelegate.config?.getBool("unsafe/report_bundleid"), reportBundleID {
-      currentApp.withCString { name in
-        rimeAPI.set_property(session, "client_app", name)
-      }
-    }
+    // v6 行为统一层：app_options 与选项初值由 core 在 set_session_owner 时统一应用，
+    // 外壳不再自行读取/下发（与 Windows/Linux 外壳一致）。
+    currentApp.withCString { heng_set_session_owner(session, $0) }
   }
 
   func destroySession() {
     if session != 0 {
-      _ = rimeAPI.destroy_session(session)
+      heng_end_session(session)
       session = 0
     }
     clearChord()
   }
 
   func processKey(_ rimeKeycode: UInt32, modifiers rimeModifiers: UInt32) -> Bool {
-    if let panel = NSApp.squirrelAppDelegate.panel {
-      if panel.linear != rimeAPI.get_option(session, "_linear") {
-        rimeAPI.set_option(session, "_linear", panel.linear)
-      }
-      if panel.vertical != rimeAPI.get_option(session, "_vertical") {
-        rimeAPI.set_option(session, "_vertical", panel.vertical)
-      }
-    }
-
-    let handled = rimeAPI.process_key(session, Int32(rimeKeycode), Int32(rimeModifiers))
+    // 注：不再同步 _linear/_vertical 到 core。这两个原版 Squirrel 的 UI 提示选项
+    // 会让 librime 把方向键路由到组合串光标移动，破坏 key_binder 的
+    // Left→Up / Right→Down 候选切换（与 Windows 端行为统一的关键）。
+    let handled = heng_process_key(session, Int32(rimeKeycode), Int32(rimeModifiers)) != 0
 
     if !handled {
       let isVimBackInCommandMode = rimeKeycode == XK_Escape || ((rimeModifiers & kControlMask.rawValue != 0) && (rimeKeycode == XK_c || rimeKeycode == XK_C || rimeKeycode == XK_bracketleft))
-      if isVimBackInCommandMode && rimeAPI.get_option(session, "vim_mode") &&
-          !rimeAPI.get_option(session, "ascii_mode") {
-        rimeAPI.set_option(session, "ascii_mode", true)
+      if isVimBackInCommandMode && hengGetOption(session, "vim_mode") &&
+          !hengGetOption(session, "ascii_mode") {
+        hengSetOption(session, "ascii_mode", true)
       }
     } else {
       let isChordingKey = switch Int32(rimeKeycode) {
@@ -424,7 +432,7 @@ private extension SquirrelInputController {
       default:
         false
       }
-      if isChordingKey && rimeAPI.get_option(session, "_chord_typing") {
+      if isChordingKey && hengGetOption(session, "_chord_typing") {
         updateChord(keycode: rimeKeycode, modifiers: rimeModifiers)
       } else if (rimeModifiers & kReleaseMask.rawValue) == 0 {
         clearChord()
@@ -435,12 +443,8 @@ private extension SquirrelInputController {
   }
 
   func rimeConsumeCommittedText() {
-    var commitText = RimeCommit.rimeStructInit()
-    if rimeAPI.get_commit(session, &commitText) {
-      if let text = commitText.text {
-        commit(string: String(cString: text))
-      }
-      _ = rimeAPI.free_commit(&commitText)
+    if let text = hengTakeCommit(session) {
+      commit(string: text)
     }
   }
 
@@ -451,28 +455,30 @@ private extension SquirrelInputController {
     }
     rimeConsumeCommittedText()
 
-    var status = RimeStatus_stdbool.rimeStructInit()
-    if rimeAPI.get_status(session, &status) {
+    var status = HengStatus()
+    status.data_size = Int32(MemoryLayout<HengStatus>.size)
+    if heng_get_status(session, &status) != 0 {
       // swiftlint:disable:next identifier_name
       if let schema_id = status.schema_id, schemaId == "" || schemaId != String(cString: schema_id) {
         schemaId = String(cString: schema_id)
         NSApp.squirrelAppDelegate.loadSettings(for: schemaId)
         if let panel = NSApp.squirrelAppDelegate.panel {
-          inlinePreedit = (panel.inlinePreedit && !rimeAPI.get_option(session, "no_inline")) || rimeAPI.get_option(session, "inline")
-          inlineCandidate = panel.inlineCandidate && !rimeAPI.get_option(session, "no_inline")
-          rimeAPI.set_option(session, "soft_cursor", !inlinePreedit)
+          inlinePreedit = (panel.inlinePreedit && !hengGetOption(session, "no_inline")) || hengGetOption(session, "inline")
+          inlineCandidate = panel.inlineCandidate && !hengGetOption(session, "no_inline")
+          hengSetOption(session, "soft_cursor", !inlinePreedit)
         }
       }
-      _ = rimeAPI.free_status(&status)
+      heng_free_status(&status)
     }
 
-    var ctx = RimeContext_stdbool.rimeStructInit()
-    if rimeAPI.get_context(session, &ctx) {
-      let preedit = ctx.composition.preedit.map({ String(cString: $0) }) ?? ""
+    var ctx = HengContext()
+    ctx.data_size = Int32(MemoryLayout<HengContext>.size)
+    if heng_get_context(session, &ctx) != 0 {
+      let preedit = ctx.preedit.map({ String(cString: $0) }) ?? ""
 
-      let start = String.Index(preedit.utf8.index(preedit.utf8.startIndex, offsetBy: Int(ctx.composition.sel_start)), within: preedit) ?? preedit.startIndex
-      let end = String.Index(preedit.utf8.index(preedit.utf8.startIndex, offsetBy: Int(ctx.composition.sel_end)), within: preedit) ?? preedit.startIndex
-      let caretPos = String.Index(preedit.utf8.index(preedit.utf8.startIndex, offsetBy: Int(ctx.composition.cursor_pos)), within: preedit) ?? preedit.startIndex
+      let start = stringIndex(utf8Offset: Int(ctx.sel_start), in: preedit)
+      let end = stringIndex(utf8Offset: Int(ctx.sel_end), in: preedit)
+      let caretPos = stringIndex(utf8Offset: Int(ctx.cursor_pos), in: preedit)
 
       if inlineCandidate {
         var candidatePreview = ctx.commit_text_preview.map { String(cString: $0) } ?? ""
@@ -484,7 +490,6 @@ private extension SquirrelInputController {
           // candidate_preview:   ^已選某些字[向左移動]|guangbiao$
           // 繼續翻頁至指定更短字詞的情形：
           // preedit:             ^已選某些字[xiang zuo]yidong|guangbiao$
-          // commit_text_preview: ^已選某些字向左yidong$
           // candidate_preview:   ^已選某些字[向左]yidong|guangbiao$
           // 光標移至當前段落最左端的情形：
           // preedit:             ^已選某些字|[xiang zuo yi dong guang biao]$
@@ -507,7 +512,6 @@ private extension SquirrelInputController {
           // preedit:             ^已選某些字|[xiang zuo]yidongguangbiao$
           // commit_text_preview: ^已選某些字向左yidongguangbiao$
           // candidate_preview:   ^已選某些字|[向左]???$
-          // FIXME: add librime APIs to support preview candidate without remaining code.
         }
         // preedit can contain additional prompt text before start:
         // ^(prompt)[selection]$
@@ -527,33 +531,33 @@ private extension SquirrelInputController {
         }
       }
 
-      let numCandidates = Int(ctx.menu.num_candidates)
+      let numCandidates = Int(ctx.candidate_count)
       var candidates = [String]()
       var comments = [String]()
       for i in 0..<numCandidates {
-        let candidate = ctx.menu.candidates[i]
-        candidates.append(candidate.text.map { String(cString: $0) } ?? "")
-        comments.append(candidate.comment.map { String(cString: $0) } ?? "")
+        let candidate = ctx.candidates[i]
+        let comment = ctx.comments[i]
+        candidates.append(candidate.map { String(cString: $0) } ?? "")
+        comments.append(comment.map { String(cString: $0) } ?? "")
       }
       var labels = [String]()
       // swiftlint:disable identifier_name
-      if let select_keys = ctx.menu.select_keys {
+      if let select_keys = ctx.select_keys {
         labels = String(cString: select_keys).map { String($0) }
-      } else if let select_labels = ctx.select_labels {
-        let pageSize = Int(ctx.menu.page_size)
-        for i in 0..<pageSize {
-          labels.append(select_labels[i].map { String(cString: $0) } ?? "")
+      } else if let labelArray = ctx.labels {
+        for i in 0..<numCandidates {
+          labels.append(labelArray[i].map { String(cString: $0) } ?? "")
         }
       }
       // swiftlint:enable identifier_name
-      let page = Int(ctx.menu.page_no)
-      let lastPage = ctx.menu.is_last_page
+      let page = Int(ctx.page_no)
+      let lastPage = ctx.is_last_page != 0
 
       let selRange = NSRange(location: start.utf16Offset(in: preedit), length: preedit.utf16.distance(from: start, to: end))
       showPanel(preedit: inlinePreedit ? "" : preedit, selRange: selRange, caretPos: caretPos.utf16Offset(in: preedit),
-                candidates: candidates, comments: comments, labels: labels, highlighted: Int(ctx.menu.highlighted_candidate_index),
+                candidates: candidates, comments: comments, labels: labels, highlighted: Int(ctx.highlighted),
                 page: page, lastPage: lastPage)
-      _ = rimeAPI.free_context(&ctx)
+      heng_free_context(&ctx)
     } else {
       hidePalettes()
     }
@@ -564,7 +568,7 @@ private extension SquirrelInputController {
 
     let forceMarkedText =
       session != 0 &&
-      rimeAPI.get_option(session, "force_marked_text_for_direct_commit")
+      hengGetOption(session, "force_marked_text_for_direct_commit")
 
     // Direct commits such as full-width punctuation do not necessarily have an
     // active marked-text phase. Some NSTextInputClient implementations require
@@ -620,17 +624,18 @@ private extension SquirrelInputController {
 
   private func handleASCIIModeToggle(_ notification: Notification) {
     guard let enableASCII = notification.object as? Bool else { return }
-    guard session != 0 && rimeAPI.find_session(session) else { return }
+    guard session != 0 else { return }
 
-    rimeAPI.set_option(session, "ascii_mode", enableASCII)
+    hengSetOption(session, "ascii_mode", enableASCII)
+    NSApp.squirrelAppDelegate.updateStatusIcon(asciiMode: enableASCII, schemaLabel: nil)
     rimeUpdate()
   }
 
   private func reportASCIIMode(_: Notification) {
     guard client != nil else { return }
-    guard session != 0 && rimeAPI.find_session(session) else { return }
+    guard session != 0 else { return }
 
-    let isASCIIMode = rimeAPI.get_option(session, "ascii_mode")
+    let isASCIIMode = hengGetOption(session, "ascii_mode")
     let status = isASCIIMode ? "ascii" : "nascii"
 
     DistributedNotificationCenter.default().postNotificationName(

@@ -4,6 +4,9 @@
 //
 //  Created by Leo Liu on 5/6/24.
 //
+//  HengIME 换血：librime 生命周期（setup/initialize/maintenance/notification）
+//  全部由 heng_core 接管；外壳只负责 heng_create / heng_destroy 时机。
+//
 
 import UserNotifications
 import Sparkle
@@ -15,7 +18,6 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
   static let updateNotificationIdentifier = "SquirrelUpdateNotification"
   static let notificationIdentifier = "SquirrelNotification"
 
-  let rimeAPI: RimeApi_stdbool = rime_get_api_stdbool().pointee
   var config: SquirrelConfig?
   var panel: SquirrelPanel?
   var enableNotifications = false
@@ -87,7 +89,7 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
 
   func syncUserData() {
     print("Sync user data")
-    _ = rimeAPI.sync_user_data()
+    _ = heng_sync_user_data() != 0
   }
 
   func openLogFolder() {
@@ -139,30 +141,22 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
   func setupRime() {
     createDirIfNotExist(path: SquirrelApp.userDir)
     createDirIfNotExist(path: SquirrelApp.logDir)
-    // Expose the log directory to librime plugins.
-    setenv("RIME_LOG_DIR", SquirrelApp.logDir.path(), 1)
-    // swiftlint:disable identifier_name
-    let notification_handler: @convention(c) (UnsafeMutableRawPointer?, RimeSessionId, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void = notificationHandler
-    let context_object = Unmanaged.passUnretained(self).toOpaque()
-    // swiftlint:enable identifier_name
-    rimeAPI.set_notification_handler(notification_handler, context_object)
-
-    var squirrelTraits = RimeTraits.rimeStructInit()
-    squirrelTraits.setCString(Bundle.main.sharedSupportPath!, to: \.shared_data_dir)
-    squirrelTraits.setCString(SquirrelApp.userDir.path(), to: \.user_data_dir)
-    squirrelTraits.setCString(SquirrelApp.logDir.path(), to: \.log_dir)
-    squirrelTraits.setCString("Squirrel", to: \.distribution_code_name)
-    squirrelTraits.setCString("鼠鬚管", to: \.distribution_name)
-    squirrelTraits.setCString(Bundle.main.object(forInfoDictionaryKey: kCFBundleVersionKey as String) as! String, to: \.distribution_version)
-    squirrelTraits.setCString("rime.squirrel", to: \.app_name)
-    rimeAPI.setup(&squirrelTraits)
   }
 
   func startRime(fullCheck: Bool) {
-    print("Initializing la rime...")
-    rimeAPI.initialize(nil)
-    if rimeAPI.start_maintenance(fullCheck) {
-      _ = rimeAPI.deploy_config_file("squirrel.yaml", "config_version")
+    print("Initializing heng-core...")
+    // fullCheck 保留入位：heng_create 内部恒为 full_check=TRUE 的完整部署
+    let sharedPath = Bundle.main.sharedSupportPath ?? ""
+    let userPath = SquirrelApp.userDir.path
+    let rc = sharedPath.withCString { shared in
+      userPath.withCString { user in
+        heng_create(shared, user)
+      }
+    }
+    if rc != 0 {
+      let message = heng_last_error().map { String(cString: $0) } ?? "(no error message)"
+      print("heng_create failed: \(message)")
+      Self.showMessage(msgText: "heng_create failed: \(message)")
     }
   }
 
@@ -247,101 +241,13 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     print("Squirrel is quitting.")
-    rimeAPI.cleanup_all_sessions()
+    heng_destroy()
     return .terminateNow
   }
 
 }
 
-extension RimeStringSlice {
-  /// Bridge the slice's pointer + length to a Swift String, honoring `.length`.
-  /// librime clips `.length` to the first Unicode character for abbreviated labels
-  /// when no explicit `abbrev:` field is defined, so reading past `.length` (e.g. with
-  /// `String(cString:)`) would incorrectly return the full `states:` value.
-  var asString: String? {
-    guard let ptr = str else { return nil }
-    let data = Data(bytes: UnsafeRawPointer(ptr), count: Int(length))
-    return String(data: data, encoding: .utf8)
-  }
-}
-
-// swiftlint:disable:next cyclomatic_complexity
-private func notificationHandler(contextObject: UnsafeMutableRawPointer?, sessionId: RimeSessionId, messageTypeC: UnsafePointer<CChar>?, messageValueC: UnsafePointer<CChar>?) {
-  let delegate: SquirrelApplicationDelegate = Unmanaged<SquirrelApplicationDelegate>.fromOpaque(contextObject!).takeUnretainedValue()
-
-  let messageType = messageTypeC.map { String(cString: $0) }
-  let messageValue = messageValueC.map { String(cString: $0) }
-
-  if messageType == "deploy" {
-    switch messageValue {
-    case "start":
-      SquirrelApplicationDelegate.showMessage(msgText: NSLocalizedString("deploy_start", comment: ""))
-    case "success":
-      SquirrelApplicationDelegate.showMessage(msgText: NSLocalizedString("deploy_success", comment: ""))
-    case "failure":
-      SquirrelApplicationDelegate.showMessage(msgText: NSLocalizedString("deploy_failure", comment: ""))
-    default:
-      break
-    }
-    return
-  } else if messageType == "option" {
-    let state = messageValue?.first != "!"
-    let optionName: String?
-    if state {
-      optionName = messageValue
-    } else if let value = messageValue {
-      optionName = String(value[value.index(after: value.startIndex)...])
-    } else {
-      optionName = nil
-    }
-    if let optionName = optionName {
-      optionName.withCString { name in
-        func shortLabel() -> String? {
-          let stateLabelShort = delegate.rimeAPI.get_state_label_abbreviated(sessionId, name, state, true)
-          return stateLabelShort.asString
-        }
-        func longLabel() -> String? {
-          let stateLabelLong = delegate.rimeAPI.get_state_label_abbreviated(sessionId, name, state, false)
-          return stateLabelLong.asString
-        }
-        if optionName == "ascii_mode" {
-          delegate.updateStatusIcon(asciiMode: state, schemaLabel: shortLabel())
-        }
-        if delegate.enableNotifications {
-          delegate.showStatusMessage(msgTextLong: longLabel(), msgTextShort: shortLabel())
-        }
-      }
-    }
-    return
-  } else if messageType == "property", let messageValue = messageValue,
-            let eqIndex = messageValue.firstIndex(of: "="), messageValue.first == "_" {
-    let key = String(messageValue[..<eqIndex])
-    let value = String(messageValue[messageValue.index(after: eqIndex)...])
-    Task.detached { @MainActor in
-      do {
-        try delegate.panel?.inputController?.handleReservedProperty(key: key, value: value, for: sessionId)
-      } catch {
-        print("Error processing handleReservedProperty: \(error)")
-      }
-    }
-    return
-  }
-
-  if delegate.enableNotifications {
-    if messageType == "schema", let messageValue = messageValue, let schemaName = try? /^[^\/]*\/(.*)$/.firstMatch(in: messageValue)?.output.1 {
-      delegate.showStatusMessage(msgTextLong: String(schemaName), msgTextShort: String(schemaName))
-      return
-    }
-  }
-}
-
 private extension SquirrelApplicationDelegate {
-  func showStatusMessage(msgTextLong: String?, msgTextShort: String?) {
-    if !(msgTextLong ?? "").isEmpty || !(msgTextShort ?? "").isEmpty {
-      panel?.updateStatus(long: msgTextLong ?? "", short: msgTextShort ?? "")
-    }
-  }
-
   func refreshStatusItem() {
     if showStatusIcon {
       if statusItem == nil {
@@ -403,7 +309,7 @@ private extension SquirrelApplicationDelegate {
 
   func shutdownRime() {
     config?.close()
-    rimeAPI.finalize()
+    heng_destroy()
   }
 
   func workspaceWillPowerOff(_: Notification) {

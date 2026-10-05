@@ -4,27 +4,30 @@
 //
 //  Created by Leo Liu on 5/9/24.
 //
+//  HengIME 换血：配置读取经 heng_config_* C ABI（librime RimeConfig 直通）。
+//
 
 import AppKit
 
 final class SquirrelConfig {
-  private let rimeAPI: RimeApi_stdbool = rime_get_api_stdbool().pointee
   private(set) var isOpen = false
 
   private var cache: [String: Any] = [:]
-  private var config: RimeConfig = .init()
+  private var config: UnsafeMutableRawPointer?
   private var baseConfig: SquirrelConfig?
 
   func openBaseConfig() -> Bool {
     close()
-    isOpen = rimeAPI.config_open("squirrel", &config)
+    config = heng_config_open("squirrel")
+    isOpen = config != nil
     return isOpen
   }
 
   func open(schemaID: String, baseConfig: SquirrelConfig?) -> Bool {
     close()
-    isOpen = rimeAPI.schema_open(schemaID, &config)
-    if isOpen {
+    config = schemaID.withCString { heng_config_open_schema($0) }
+    if config != nil {
+      isOpen = true
       self.baseConfig = baseConfig
     }
     return isOpen
@@ -32,7 +35,10 @@ final class SquirrelConfig {
 
   func close() {
     if isOpen {
-      _ = rimeAPI.config_close(&config)
+      if let config = config {
+        heng_config_close(config)
+      }
+      config = nil
       baseConfig = nil
       isOpen = false
     }
@@ -43,24 +49,23 @@ final class SquirrelConfig {
   }
 
   func has(section: String) -> Bool {
-    if isOpen {
-      var iterator: RimeConfigIterator = .init()
-      if rimeAPI.config_begin_map(&iterator, &config, section) {
-        rimeAPI.config_end(&iterator)
-        return true
-      }
+    guard isOpen, let config = config else { return false }
+    var iterator = HengConfigIterator()
+    let hit = section.withCString { heng_config_begin_map(config, $0, &iterator) } != 0
+    if hit {
+      heng_config_end(&iterator)
     }
-    return false
+    return hit
   }
 
   func getBool(_ option: String) -> Bool? {
     if let cachedValue = cachedValue(of: Bool.self, forKey: option) {
       return cachedValue
     }
-    var value = false
-    if isOpen && rimeAPI.config_get_bool(&config, option, &value) {
-      cache[option] = value
-      return value
+    var value: Int32 = 0
+    if isOpen, let config = config, option.withCString({ heng_config_get_bool(config, $0, &value) }) != 0 {
+      cache[option] = value != 0
+      return value != 0
     }
     return baseConfig?.getBool(option)
   }
@@ -70,7 +75,7 @@ final class SquirrelConfig {
       return cachedValue
     }
     var value: Double = 0
-    if isOpen && rimeAPI.config_get_double(&config, option, &value) {
+    if isOpen, let config = config, option.withCString({ heng_config_get_double(config, $0, &value) }) != 0 {
       cache[option] = value
       return value
     }
@@ -81,9 +86,9 @@ final class SquirrelConfig {
     if let cachedValue = cachedValue(of: String.self, forKey: option) {
       return cachedValue
     }
-    if isOpen, let value = rimeAPI.config_get_cstring(&config, option) {
-      cache[option] = String(cString: value)
-      return String(cString: value)
+    if isOpen, let config = config, let value = readString(option, from: config) {
+      cache[option] = value
+      return value
     }
     return baseConfig?.getString(option)
   }
@@ -100,16 +105,19 @@ final class SquirrelConfig {
   }
 
   func getAppOptions(_ appName: String) -> [String: Bool] {
-    let rootKey = "app_options/\(appName)"
     var appOptions = [String: Bool]()
-    var iterator = RimeConfigIterator()
-    _ = rimeAPI.config_begin_map(&iterator, &config, rootKey)
-    while rimeAPI.config_next(&iterator) {
-      if let key = iterator.key, let path = iterator.path, let value = getBool(String(cString: path)) {
-        appOptions[String(cString: key)] = value
+    guard isOpen, let config = config else { return appOptions }
+    let rootKey = "app_options/\(appName)"
+    var iterator = HengConfigIterator()
+    let began = rootKey.withCString { heng_config_begin_map(config, $0, &iterator) } != 0
+    if began {
+      while heng_config_next(&iterator) != 0 {
+        if let key = iterator.key, let path = iterator.path, let value = getBool(String(cString: path)) {
+          appOptions[String(cString: key)] = value
+        }
       }
+      heng_config_end(&iterator)
     }
-    rimeAPI.config_end(&iterator)
     return appOptions
   }
 }
@@ -117,6 +125,24 @@ final class SquirrelConfig {
 private extension SquirrelConfig {
   func cachedValue<T>(of: T.Type, forKey key: String) -> T? {
     return cache[key] as? T
+  }
+
+  /// heng_config_get_string 读取：先固定缓冲，缓冲不足时按返回的所需长度重试。
+  /// （ABI 约定 buf_len<=0 直接返回未命中，不能拿 0 去探测长度）
+  func readString(_ option: String, from config: UnsafeMutableRawPointer) -> String? {
+    option.withCString { key -> String? in
+      var size: Int32 = 256
+      var buffer = [CChar](repeating: 0, count: Int(size))
+      var written = heng_config_get_string(config, key, &buffer, size)
+      if written > size {
+        // 键存在但缓冲不足：返回值 = 所需长度（含 NUL），按它重试一次
+        size = written
+        buffer = [CChar](repeating: 0, count: Int(size))
+        written = heng_config_get_string(config, key, &buffer, size)
+      }
+      guard written > 0, written < size else { return nil }
+      return String(cString: buffer)
+    }
   }
 
   func color(from colorStr: String, inSpace colorSpace: SquirrelTheme.RimeColorSpace) -> NSColor? {
