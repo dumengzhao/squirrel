@@ -9,10 +9,23 @@ import Foundation
 import InputMethodKit
 
 final class SquirrelInstaller {
-  enum InputMode: String, CaseIterable {
-    static let primary = Self.hans
-    case hans = "im.rime.inputmethod.Squirrel.Hans"
-    case hant = "im.rime.inputmethod.Squirrel.Hant"
+  // 输入源 mode ID 从 bundle id 派生（正式版 im.rime.inputmethod.Squirrel.Hans，
+  // 测试版随 bundle id 变化），不再硬编码，支持双版本并存
+  struct InputMode: Hashable {
+    static let prefix = Bundle.main.bundleIdentifier ?? "im.rime.inputmethod.Squirrel"
+    static let allCases: [InputMode] = [.hans, .hant]
+    static let primary = InputMode.hans
+    let rawValue: String
+    private init(idSuffix: String) { self.rawValue = "\(Self.prefix).\(idSuffix)" }
+    init?(rawValue: String) {
+      switch rawValue {
+      case "\(Self.prefix).Hans", "Hans": self = .hans
+      case "\(Self.prefix).Hant", "Hant": self = .hant
+      default: return nil
+      }
+    }
+    static let hans = InputMode(idSuffix: "Hans")
+    static let hant = InputMode(idSuffix: "Hant")
   }
   private lazy var inputSources: [String: TISInputSource] = {
     var inputSources = [String: TISInputSource]()

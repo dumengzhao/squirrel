@@ -10,14 +10,17 @@ import InputMethodKit
 
 @main
 struct SquirrelApp {
-  static let userDir = if let pwuid = getpwuid(getuid()) {
-    URL(fileURLWithFileSystemRepresentation: pwuid.pointee.pw_dir, isDirectory: true, relativeTo: nil).appending(components: "Library", "Rime")
-  } else {
-    try! FileManager.default.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false).appendingPathComponent("Rime", isDirectory: true)
-  }
-  static let appDir = "/Library/Input Methods/Squirrel.app".withCString { dir in
-    URL(fileURLWithFileSystemRepresentation: dir, isDirectory: false, relativeTo: nil)
-  }
+  // rime 用户目录：默认 ~/Library/Rime；Info.plist 的 HengRimeUserDirName 可覆盖目录名
+  // （测试版写 Rime-dev，与正式版词库/部署完全隔离）
+  static let userDir: URL = {
+    let dirName = Bundle.main.object(forInfoDictionaryKey: "HengRimeUserDirName") as? String ?? "Rime"
+    if let pwuid = getpwuid(getuid()) {
+      return URL(fileURLWithFileSystemRepresentation: pwuid.pointee.pw_dir, isDirectory: true, relativeTo: nil).appending(components: "Library", dirName)
+    }
+    return try! FileManager.default.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false).appendingPathComponent(dirName, isDirectory: true)
+  }()
+  // 本 app 的安装位置：从自身 bundle 推导，不再硬编码 /Library 路径（支持测试版装在用户目录）
+  static let appDir = Bundle.main.bundleURL
   static let logDir = FileManager.default.temporaryDirectory.appending(component: "rime.squirrel", directoryHint: .isDirectory)
 
   // swiftlint:disable:next cyclomatic_complexity
