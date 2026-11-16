@@ -8,6 +8,11 @@
 import AppKit
 
 final class SquirrelPanel: NSPanel {
+  // 同上：候选窗绝不能夺走宿主的 key 状态（CGShieldingWindowLevel + 能成 key
+  // 会让宿主彻底收不到键盘事件）。
+  override var canBecomeKey: Bool { false }
+  override var canBecomeMain: Bool { false }
+
   private let view: SquirrelView
   private let back: NSView
   var inputController: SquirrelInputController?

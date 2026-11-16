@@ -23,7 +23,13 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
   var enableNotifications = false
   var showStatusIcon: Bool = true
   var statusItem: NSStatusItem?
-  let updateController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+  /// dev 包（bundle id 以 .dev 结尾）不启动更新器：
+  /// Info.plist 里的 SUFeedURL 指向 rime 官方的 appcast，dev 版不该去查它
+  /// —— 既免掉周期性网络请求，也避免「提示更新到上游版本」把人带沟里。
+  static let isDevBuild = (Bundle.main.bundleIdentifier ?? "").hasSuffix(".dev")
+  let updateController = SPUStandardUpdaterController(
+    startingUpdater: !SquirrelApplicationDelegate.isDevBuild,
+    updaterDelegate: nil, userDriverDelegate: nil)
   var supportsGentleScheduledUpdateReminders: Bool {
     true
   }
@@ -143,8 +149,71 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
     createDirIfNotExist(path: SquirrelApp.logDir)
   }
 
+  /// 系统级键盘事件捕获（CGEventTap）。
+  ///
+  /// HBuilderX 的 QtWebEngine 不把 keyDown 交给输入法（只在「组合中」才交，
+  /// 而组合态会污染文档模型并吞掉页面级快捷键），所以那一类宿主改由这里接管：
+  /// 可写 tap 先拿键 → `handleTapKey` 问 Rime → 消费就吞掉、不消费原样放行。
+  /// 只有最前台是 HBuilderX 时才会真的介入，其它应用完全不受影响。
+  ///
+  /// 拿不到「发送事件」授权时自动退回只读监听：此时 HBuilderX 代码区退回
+  /// 「只能打英文」，但绝不会出现卡键。
+  private var eventTap: CFMachPort?
+  /// tap 句柄的静态副本：回调是 C 函数指针，拿不到 self。
+  private static var activeTap: CFMachPort?
+
+  private func probeEventTapAccess() {
+    let listen = CGPreflightListenEventAccess()
+    let post = CGPreflightPostEventAccess()
+    let mask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+    var mode = "none"
+    // 只读即可：tap 现在只做「鼠标点击前清组合态」这一件被动的事，不拦截
+    // 也不吞任何事件，所以不需要「发送事件」授权，只要「输入监控」。
+    let wanted: CGEventTapOptions = .listenOnly
+    if let tap = CGEvent.tapCreate(
+      tap: .cgSessionEventTap,
+      place: .headInsertEventTap,
+      options: wanted,
+      eventsOfInterest: mask,
+      callback: { _, type, event, _ in
+        // 系统会因为我们回调超时/用户强制输入而把 tap 停掉，停了就再也不会投递。
+        // 长期运行时这表现为「点击前不再清组合态」，必须自己重新启用。
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+          HengWindowRenderer.log("TAP disabled type=\(type.rawValue)")
+          if let t = SquirrelApplicationDelegate.activeTap {
+            CGEvent.tapEnable(tap: t, enable: true)
+          }
+          return Unmanaged.passUnretained(event)
+        }
+        // 鼠标按下：先把宿主的「组合中」状态撤掉，再原样放行。
+        // 宿主在 marked text 非空时会把第一次点击拿去结束组合，点击落不到 widget
+        //（HBuilderX 表现为文件树点两次只生效一次）。**不判断是哪个应用**。
+        if type == .leftMouseDown {
+          SquirrelInputController.lastActive?.endCompositionBeforeClick()
+        }
+        return Unmanaged.passUnretained(event)
+      },
+      userInfo: nil
+    ) {
+      let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+      CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+      CGEvent.tapEnable(tap: tap, enable: true)
+      eventTap = tap
+      SquirrelApplicationDelegate.activeTap = tap
+      mode = "mouseOnly"
+    }
+    HengWindowRenderer.log("TAP mode=\(mode) listen=\(listen) post=\(post)")
+  }
+
   func startRime(fullCheck: Bool) {
     print("Initializing heng-core...")
+    probeEventTapAccess()
+    // M-P4：注册窗口后端。core 只做slint 渲染，窗口贴帧由外壳在主线程执行。
+    // 必须在 heng_create 之前—— core 启动 UI 线程后会立刻回调要窗口。
+    let regRc = HengWindowRenderer.shared.register()
+    let msg = "registered=\(regRc > 0) screen=\(HengWindowRenderer.shared.debugScreenInfo())"
+    print("HengWindowRenderer \(msg)")
+    HengWindowRenderer.log("REGISTER \(msg)")
     // fullCheck 保留入位：heng_create 内部恒为 full_check=TRUE 的完整部署
     let sharedPath = Bundle.main.sharedSupportPath ?? ""
     let userPath = SquirrelApp.userDir.path

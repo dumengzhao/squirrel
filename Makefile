@@ -99,6 +99,14 @@ endif
 
 BUILD_SETTINGS += COMPILER_INDEX_STORE_ENABLE=YES
 
+# 用固定的自签证书签名，而不是默认的 ad-hoc（"Sign to Run Locally"）。
+# ad-hoc 签名的 CDHash 每次编译都变，系统会当成另一个 app，
+# 「输入监控 / 辅助功能」的 TCC 授权随之失效 —— CGEventTap 直接拿不到权限。
+# 固定证书的 designated requirement 不含 CDHash，授权一次即可长期有效。
+# 可用 `security find-identity -v -p codesigning` 查看本机身份。
+HENG_SIGN_IDENTITY ?= ClipSync Dev
+BUILD_SETTINGS += CODE_SIGN_IDENTITY="$(HENG_SIGN_IDENTITY)" CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES
+
 release: $(DEPS_CHECK)
 	mkdir -p $(DERIVED_DATA_PATH)
 	bash package/add_data_files

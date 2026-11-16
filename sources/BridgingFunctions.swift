@@ -18,13 +18,24 @@ typealias RimeSessionId = UInt64
 /// 读取会话选项（heng_get_option）。
 func hengGetOption(_ session: RimeSessionId, _ option: String) -> Bool {
   guard session != 0 else { return false }
-  return option.withCString { heng_get_option(session, $0) } != 0
+  return option.withCString { heng_get_option(session, $0) != 0 }
 }
 
 /// 设置会话选项（heng_set_option；传播/持久化策略由 core 统一处理）。
 func hengSetOption(_ session: RimeSessionId, _ option: String, _ value: Bool) {
   guard session != 0 else { return }
-  option.withCString { heng_set_option(session, $0, value ? 1 : 0) }
+  _ = option.withCString { heng_set_option(session, $0, value ? 1 : 0) }
+}
+
+/// 上报 inline_preedit 开关给 core（heng_set_inline_preedit）。仅 macOS 有效。
+func hengSetInlinePreedit(_ on: Bool) {
+  heng_set_inline_preedit(on ? 1 : 0)
+}
+
+/// 读 weasel.custom.yaml 的 style/<key>（heng_style_flag，源补丁直读，不过部署缓存）。
+/// 返回调用方传入的 defaultValue = 键不存在（无覆盖）；0/1 = 有显式值。
+func hengStyleFlag(_ key: String, _ defaultValue: Int32) -> Int32 {
+  return key.withCString { heng_style_flag($0, defaultValue) }
 }
 
 /// 取待上屏文本（消费语义）。
@@ -32,6 +43,19 @@ func hengTakeCommit(_ session: RimeSessionId) -> String? {
   guard session != 0 else { return nil }
   var ptr: UnsafeMutablePointer<CChar>?
   guard heng_commit_text(session, &ptr) != 0, let text = ptr else { return nil }
+  defer { heng_free_string(text) }
+  return String(cString: text)
+}
+
+/// 取「鼠标点选候选」产生的上屏文本（消费语义）。
+///
+/// 与 hengTakeCommit 分开：按键路径的 commit 由 rimeUpdate 开头统一取，
+/// 而点选候选没有任何按键事件伴随，必须在点击处理里显式取一次，
+/// 否则候选窗关了但字不上屏。
+func hengTakeUiCommit(_ session: RimeSessionId) -> String? {
+  guard session != 0 else { return nil }
+  var ptr: UnsafeMutablePointer<CChar>?
+  guard heng_take_ui_commit(session, &ptr) != 0, let text = ptr else { return nil }
   defer { heng_free_string(text) }
   return String(cString: text)
 }
@@ -103,4 +127,37 @@ extension NSPoint {
   var length: CGFloat {
     sqrt(pow(self.x, 2) + pow(self.y, 2))
   }
+}
+
+// MARK: - 上屏回调（点击选词）
+
+/// core 选词完成后回调这个 C 函数（经 heng_set_commit_handler 注册）。
+///
+/// 为什么必须用回调而不是轮询：点击事件从 Swift 主线程发给 core UI 线程，
+/// core 要跨两轮循环（poll_events 收点击 → 下一轮 try_recv 才拿到 BarSelect）
+/// 才处理完并产出 commit，实测比主线程的下一轮**晚约 9ms**。
+/// 外壳在 mouseUp 里 DispatchQueue.main.async 取的话必定取空
+/// —— 实测 takeUiCommit 返回 nil，而 9ms 后 map 里才出现文本。
+/// 回调则由 core 在文本就绪的同一刻发起，时序天然正确。
+private let commitCallback: @convention(c) (UnsafeMutableRawPointer?, UInt64, UnsafePointer<CChar>?) -> Void = {
+  _, session, text in
+  guard let text else { return }
+  let s = String(cString: text)
+  // 带上会话句柄：工具窗（表情/符号）的上屏可能投给「最近用过的会话」，
+  // 而同一进程里每个宿主都挂着一个 controller。只有 session 相符的那个
+  // 才该把字插进自己的 client，否则一次点击会往多个应用里各插一份。
+  DispatchQueue.main.async {
+    NotificationCenter.default.post(
+      name: .hengCoreCommitReady, object: nil,
+      userInfo: ["text": s, "session": session])
+  }
+}
+
+extension Notification.Name {
+  static let hengCoreCommitReady = Notification.Name("HengCoreCommitReady")
+}
+
+/// 注册上屏回调（进程级，只需一次）。幂等。
+func hengRegisterCommitHandler() {
+  heng_set_commit_handler(commitCallback, nil)
 }

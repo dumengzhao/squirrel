@@ -46,6 +46,7 @@
 		44E21A9016A653E700C2B08F /* rime_deployer in CopyFiles */ = {isa = PBXBuildFile; fileRef = 44E21A8E16A653E700C2B08F /* rime_deployer */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		44E21A9116A653E700C2B08F /* rime_dict_manager in CopyFiles */ = {isa = PBXBuildFile; fileRef = 44E21A8F16A653E700C2B08F /* rime_dict_manager */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		77AA68142588916F00A592E2 /* hk2s.json in Copy opencc Files */ = {isa = PBXBuildFile; fileRef = 77AA67E22588916300A592E2 /* hk2s.json */; };
+		HENG0005000000000000000005 /* emoji.txt in Copy opencc Files */ = {isa = PBXBuildFile; fileRef = HENG0006000000000000000006 /* emoji.txt */; };
 		77AA68152588916F00A592E2 /* HKVariants.ocd2 in Copy opencc Files */ = {isa = PBXBuildFile; fileRef = 77AA67DC2588916300A592E2 /* HKVariants.ocd2 */; };
 		77AA68162588916F00A592E2 /* HKVariantsRev.ocd2 in Copy opencc Files */ = {isa = PBXBuildFile; fileRef = 77AA67E02588916300A592E2 /* HKVariantsRev.ocd2 */; };
 		77AA68172588916F00A592E2 /* HKVariantsRevPhrases.ocd2 in Copy opencc Files */ = {isa = PBXBuildFile; fileRef = 77AA67E92588916300A592E2 /* HKVariantsRevPhrases.ocd2 */; };
@@ -117,7 +118,9 @@
 		B3A0041D26100500009D156B /* double_pinyin_ziguang.schema.yaml in Copy Shared Support Files */ = {isa = PBXBuildFile; fileRef = B3A0041E26100500009D156B /* double_pinyin_ziguang.schema.yaml */; };
 		B3A0041E26100500009D156B /* double_pinyin_ziguang.schema.yaml */ = {isa = PBXFileReference; lastKnownFileType = text; name = double_pinyin_ziguang.schema.yaml; path = data/plum/double_pinyin_ziguang.schema.yaml; sourceTree = "<group>"; };
 		B3A0041F26100500009D156B /* cn_dicts in Copy Shared Support Files */ = {isa = PBXBuildFile; fileRef = B3A0042026100500009D156B /* cn_dicts */; };
+		HENG0004000000000000000004 /* others in Copy Shared Support Files */ = {isa = PBXBuildFile; fileRef = HENG0003000000000000000003 /* others */; };
 		B3A0042026100500009D156B /* cn_dicts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = cn_dicts; path = data/plum/cn_dicts; sourceTree = "<group>"; };
+		HENG0003000000000000000003 /* others */ = {isa = PBXFileReference; lastKnownFileType = folder; name = others; path = "../../../runtime/rime-shared/others"; sourceTree = "<group>"; };
 		B3A0042126100500009D156B /* en_dicts in Copy Shared Support Files */ = {isa = PBXBuildFile; fileRef = B3A0042226100500009D156B /* en_dicts */; };
 		B3A0042226100500009D156B /* en_dicts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = en_dicts; path = data/plum/en_dicts; sourceTree = "<group>"; };
 		B3A002F026100500009D156B /* lua */ = {isa = PBXFileReference; lastKnownFileType = folder; name = lua; path = data/plum/lua; sourceTree = "<group>"; };
@@ -128,6 +131,7 @@
 		B35D2FE82BF00839009D156B /* BridgingFunctions.swift in Sources */ = {isa = PBXBuildFile; fileRef = B35D2FE72BF00839009D156B /* BridgingFunctions.swift */; };
 		B3A001022F260100009D156B /* ReservedProperty.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3A001012F260100009D156B /* ReservedProperty.swift */; };
 		B38E9B912BE9AE1E0036ABEF /* SquirrelApplicationDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = B38E9B902BE9AE1E0036ABEF /* SquirrelApplicationDelegate.swift */; };
+		HENG0002000000000000000002 /* HengWindowRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = HENG0001000000000000000001 /* HengWindowRenderer.swift */; };
 		B38E9B952BEAFEFD0036ABEF /* SquirrelInputController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B38E9B942BEAFEFD0036ABEF /* SquirrelInputController.swift */; };
 		B39771232BECEA150093A49B /* MacOSKeyCodes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B39771222BECEA150093A49B /* MacOSKeyCodes.swift */; };
 		B39771252BED899F0093A49B /* SquirrelConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = B39771242BED899F0093A49B /* SquirrelConfig.swift */; };
@@ -165,6 +169,7 @@
 			dstSubfolderSpec = 12;
 			files = (
 				77AA68142588916F00A592E2 /* hk2s.json in Copy opencc Files */,
+				HENG0005000000000000000005 /* emoji.txt in Copy opencc Files */,
 				77AA68152588916F00A592E2 /* HKVariants.ocd2 in Copy opencc Files */,
 				77AA68162588916F00A592E2 /* HKVariantsRev.ocd2 in Copy opencc Files */,
 				77AA68172588916F00A592E2 /* HKVariantsRevPhrases.ocd2 in Copy opencc Files */,
@@ -255,6 +260,7 @@
 				B3A0041B26100500009D156B /* double_pinyin_sogou.schema.yaml in Copy Shared Support Files */,
 				B3A0041D26100500009D156B /* double_pinyin_ziguang.schema.yaml in Copy Shared Support Files */,
 				B3A0041F26100500009D156B /* cn_dicts in Copy Shared Support Files */,
+				HENG0004000000000000000004 /* others in Copy Shared Support Files */,
 				B3A0042126100500009D156B /* en_dicts in Copy Shared Support Files */,
 			);
 			name = "Copy Shared Support Files";
@@ -332,6 +338,7 @@
 		77AA67E02588916300A592E2 /* HKVariantsRev.ocd2 */ = {isa = PBXFileReference; lastKnownFileType = file; path = HKVariantsRev.ocd2; sourceTree = "<group>"; };
 		77AA67E12588916300A592E2 /* JPShinjitaiPhrases.ocd2 */ = {isa = PBXFileReference; lastKnownFileType = file; path = JPShinjitaiPhrases.ocd2; sourceTree = "<group>"; };
 		77AA67E22588916300A592E2 /* hk2s.json */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.json; path = hk2s.json; sourceTree = "<group>"; };
+		HENG0006000000000000000006 /* emoji.txt */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text; name = emoji.txt; path = "../../../runtime/rime-shared/opencc/emoji.txt"; sourceTree = SOURCE_ROOT; };
 		77AA67E32588916300A592E2 /* TSCharacters.ocd2 */ = {isa = PBXFileReference; lastKnownFileType = file; path = TSCharacters.ocd2; sourceTree = "<group>"; };
 		77AA67E42588916300A592E2 /* JPVariantsRev.ocd2 */ = {isa = PBXFileReference; lastKnownFileType = file; path = JPVariantsRev.ocd2; sourceTree = "<group>"; };
 		77AA67E52588916300A592E2 /* JPShinjitaiCharacters.ocd2 */ = {isa = PBXFileReference; lastKnownFileType = file; path = JPShinjitaiCharacters.ocd2; sourceTree = "<group>"; };
@@ -370,6 +377,7 @@
 		B3A001012F260100009D156B /* ReservedProperty.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ReservedProperty.swift; path = sources/ReservedProperty.swift; sourceTree = "<group>"; };
 		B38E9B8F2BE9AE1E0036ABEF /* Squirrel-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "Squirrel-Bridging-Header.h"; path = "sources/Squirrel-Bridging-Header.h"; sourceTree = "<group>"; };
 		B38E9B902BE9AE1E0036ABEF /* SquirrelApplicationDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SquirrelApplicationDelegate.swift; path = sources/SquirrelApplicationDelegate.swift; sourceTree = "<group>"; };
+		HENG0001000000000000000001 /* HengWindowRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = HengWindowRenderer.swift; path = sources/HengWindowRenderer.swift; sourceTree = "<group>"; };
 		B38E9B942BEAFEFD0036ABEF /* SquirrelInputController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SquirrelInputController.swift; path = sources/SquirrelInputController.swift; sourceTree = "<group>"; };
 		B39771222BECEA150093A49B /* MacOSKeyCodes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MacOSKeyCodes.swift; path = sources/MacOSKeyCodes.swift; sourceTree = "<group>"; };
 		B39771242BED899F0093A49B /* SquirrelConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SquirrelConfig.swift; path = sources/SquirrelConfig.swift; sourceTree = "<group>"; };
@@ -406,6 +414,7 @@
 			isa = PBXGroup;
 			children = (
 				B38E9B902BE9AE1E0036ABEF /* SquirrelApplicationDelegate.swift */,
+				HENG0001000000000000000001 /* HengWindowRenderer.swift */,
 				B38E9B942BEAFEFD0036ABEF /* SquirrelInputController.swift */,
 				B39771222BECEA150093A49B /* MacOSKeyCodes.swift */,
 				B397712C2BEEB39D0093A49B /* InputSource.swift */,
@@ -500,6 +509,7 @@
 			isa = PBXGroup;
 			children = (
 				77AA67E22588916300A592E2 /* hk2s.json */,
+				HENG0006000000000000000006 /* emoji.txt */,
 				77AA67DC2588916300A592E2 /* HKVariants.ocd2 */,
 				77AA67E02588916300A592E2 /* HKVariantsRev.ocd2 */,
 				77AA67E92588916300A592E2 /* HKVariantsRevPhrases.ocd2 */,
@@ -548,6 +558,7 @@
 				442B5B871570C37200370DEA /* squirrel.yaml */,
 				7B5488A71D2DAC9D0056A1BE /* plum */,
 				4407F39D14EC071E001329FE /* opencc */,
+				HENG0003000000000000000003 /* others */,
 			);
 			name = SharedSupport;
 			sourceTree = "<group>";
@@ -684,6 +695,7 @@
 				B397712D2BEEB39D0093A49B /* InputSource.swift in Sources */,
 				B397712B2BEE4C160093A49B /* SquirrelPanel.swift in Sources */,
 				B38E9B912BE9AE1E0036ABEF /* SquirrelApplicationDelegate.swift in Sources */,
+				HENG0002000000000000000002 /* HengWindowRenderer.swift in Sources */,
 				B39771272BED9B250093A49B /* SquirrelTheme.swift in Sources */,
 				B35D2FE82BF00839009D156B /* BridgingFunctions.swift in Sources */,
 				B3A001022F260100009D156B /* ReservedProperty.swift in Sources */,
