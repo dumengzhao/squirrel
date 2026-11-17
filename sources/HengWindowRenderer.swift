@@ -34,6 +34,7 @@ final class HengWindowRenderer: NSObject {
     case letters = 2    // 顶部字母区
     case tools = 3      // 符号窗口（长驻、nonactivating）
     case emoji = 4      // 表情窗口（长驻、nonactivating，与符号窗独立）
+    case vkbd = 5       // 软键盘（长驻、nonactivating）
   }
 
   /// 操作类型，与 core 的 op 参数一一对应
@@ -162,6 +163,10 @@ final class HengWindowRenderer: NSObject {
       geo = (Int(p[0]), Int(p[1]), Int(p[2]), Int(p[3]))
     }
     let lw = Int(logicalW), lh = Int(logicalH)
+    let tEntry = CFAbsoluteTimeGetCurrent()
+    if win == Win.vkbd.rawValue && op != Op.blit {
+      Self.log("VKBD handle op=\(op) t=\(tEntry)")
+    }
 
     DispatchQueue.main.async {
       defer { copy?.deallocate() }
@@ -218,6 +223,7 @@ final class HengWindowRenderer: NSObject {
       installMouseTracking()
 
     case Op.show:
+      let tShow = CFAbsoluteTimeGetCurrent()
       let panel = ensurePanel(win)
       noteFront(win)
       installMouseTracking()
@@ -288,7 +294,14 @@ final class HengWindowRenderer: NSObject {
         }
       }
 
+      if win == Win.vkbd.rawValue {
+        Self.log("VKBD show-cost \(Int((CFAbsoluteTimeGetCurrent() - tShow) * 1000))ms visible=\(panel.isVisible) onSpace=\(panel.isOnActiveSpace)")
+      }
+
     case Op.hide:
+      if win == Win.vkbd.rawValue {
+        Self.log("VKBD hide t=\(CFAbsoluteTimeGetCurrent())")
+      }
       panels[win]?.orderOut(nil)
 
     case Op.blit:
@@ -378,7 +391,7 @@ final class HengWindowRenderer: NSObject {
     // ===== 候选窗/工具窗要能点选，必须显式开这两项 =====
     // nonactivatingPanel 默认 ignoresMouseEvents = true，点它等于点穿到下层应用，
     // 候选格/符号格永远收不到点击。设置窗是 .borderless 不受影响。
-    if kind == .candidate || kind == .tools || kind == .emoji {
+    if kind == .candidate || kind == .tools || kind == .emoji || kind == .vkbd {
       panel.ignoresMouseEvents = false
       // 不激活也能收点击：候选窗是 nonactivatingPanel，点击它不应抢走
       // 宿主应用（TextEdit 等）的键盘焦点，否则用户点一下候选词就丢了编辑焦点。
@@ -627,7 +640,7 @@ final class HengWindowRenderer: NSObject {
     let loc = NSEvent.mouseLocation
     let all = [
       Win.candidate.rawValue, Win.settings.rawValue,
-      Win.tools.rawValue, Win.emoji.rawValue
+      Win.tools.rawValue, Win.emoji.rawValue, Win.vkbd.rawValue
     ]
     var order = zOrder
     order.append(contentsOf: all.filter { !zOrder.contains($0) })
@@ -739,4 +752,555 @@ final class HengTrackingView: NSView {
 final class HengOverlayPanel: NSPanel {
   override var canBecomeKey: Bool { false }
   override var canBecomeMain: Bool { false }
+}
+
+
+// MARK: - 区域截图（自绘覆盖窗）
+
+/// 覆盖窗专用：无边框窗口默认不能成为 key，拿不到键盘事件（Esc 就失效了）。
+final class OverlayWindow: NSWindow {
+  override var canBecomeKey: Bool { true }
+  override var canBecomeMain: Bool { true }
+}
+
+/// 全屏覆盖窗：拖拽选区、四角四边缩放、工具条（取消 / 保存 / 确认）。
+/// 安全约束：必须永远能退出——Esc、右键、✕、3 分钟看门狗。
+final class ScreenshotOverlay: NSObject {
+  static let shared = ScreenshotOverlay()
+
+  private var windows: [NSWindow] = []
+  private var active = false
+  private var watchdog: Timer?
+
+  var isActive: Bool { active }
+
+  func begin() {
+    guard !active else { return }
+    active = true
+    for screen in NSScreen.screens {
+      let win = OverlayWindow(
+        contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+      win.level = .init(Int(CGShieldingWindowLevel()))
+      win.backgroundColor = .clear
+      win.isOpaque = false
+      win.hasShadow = false
+      win.ignoresMouseEvents = false
+      win.acceptsMouseMovedEvents = true
+      win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+      win.isReleasedWhenClosed = false
+      let view = SelectionView(frame: NSRect(origin: .zero, size: screen.frame.size))
+      view.wantsLayer = true
+      view.layer?.backgroundColor = .clear
+      view.onCancel = { [weak self] in self?.cancel() }
+      view.onConfirm = { [weak self] rect, owner in self?.confirm(rect, from: owner) }
+      view.onSave = { [weak self] rect, owner in self?.saveToFolder(rect, from: owner) }
+      win.contentView = view
+      win.makeKeyAndOrderFront(nil)
+      windows.append(win)
+    }
+    NSApp.activate(ignoringOtherApps: true)
+    windows.first?.makeKey()
+    windows.first?.makeFirstResponder(windows.first?.contentView)
+    watchdog = Timer.scheduledTimer(withTimeInterval: 180, repeats: false) { [weak self] _ in
+      self?.cancel()
+    }
+  }
+
+  private func hideAll() {
+    for w in windows { w.orderOut(nil) }
+  }
+
+  private func showAll() {
+    for w in windows { w.makeKeyAndOrderFront(nil) }
+    NSApp.activate(ignoringOtherApps: true)
+    windows.first?.makeKey()
+    windows.first?.makeFirstResponder(windows.first?.contentView)
+  }
+
+  private func close() {
+    watchdog?.invalidate()
+    watchdog = nil
+    for w in windows {
+      w.orderOut(nil)
+      w.contentView = nil
+    }
+    windows.removeAll()
+    active = false
+  }
+
+  func cancel() {
+    guard active else { return }
+    close()
+  }
+
+  /// 把选区抓成 PNG 数据（抓之前先撤掉遮罩）
+  private func grab(
+    _ rect: NSRect, screen: NSScreen, windowID: CGWindowID = 0,
+    _ done: @escaping (Data?) -> Void
+  ) {
+    let frame = screen.frame
+    let globalBL = NSPoint(x: frame.origin.x + rect.origin.x, y: frame.origin.y + rect.origin.y)
+    let mainH = CGDisplayBounds(CGMainDisplayID()).height
+    let x = Int(globalBL.x.rounded())
+    let y = Int((mainH - globalBL.y - rect.height).rounded())
+    let w = max(1, Int(rect.width.rounded()))
+    let h = max(1, Int(rect.height.rounded()))
+    hideAll()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+      let tmp = NSTemporaryDirectory() + "heng-shot.png"
+      try? FileManager.default.removeItem(atPath: tmp)
+      let task = Process()
+      task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+      if windowID != 0 {
+        // -l：只截该窗口，不受其他窗口遮挡影响
+        task.arguments = ["-x", "-o", "-l\(windowID)", tmp]
+      } else {
+        task.arguments = ["-x", "-R", "\(x),\(y),\(w),\(h)", tmp]
+      }
+      do { try task.run() } catch { done(nil); return }
+      task.waitUntilExit()
+      if let data = try? Data(contentsOf: URL(fileURLWithPath: tmp)) {
+        done(data)
+        return
+      }
+      // 窗口已关闭 / -l 失败：回退到按矩形截
+      guard windowID != 0 else { done(nil); return }
+      let fallback = Process()
+      fallback.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+      fallback.arguments = ["-x", "-R", "\(x),\(y),\(w),\(h)", tmp]
+      do { try fallback.run() } catch { done(nil); return }
+      fallback.waitUntilExit()
+      done(try? Data(contentsOf: URL(fileURLWithPath: tmp)))
+    }
+  }
+
+  private static func stamp() -> String {
+    let df = DateFormatter()
+    df.dateFormat = "yyyyMMddHHmmssSSS"
+    return df.string(from: Date())
+  }
+
+  /// 绿勾：进剪贴板 + 存桌面
+  private func confirm(_ rect: NSRect, from view: SelectionView) {
+    guard active, let screen = view.window?.screen else { cancel(); return }
+    grab(rect, screen: screen, windowID: view.windowIDForCapture) { [weak self] data in
+      guard let self else { return }
+      defer { self.cancel() }
+      guard let data, let img = NSImage(data: data) else { NSSound.beep(); return }
+      let pb = NSPasteboard.general
+      pb.clearContents()
+      pb.writeObjects([img])
+      let dst = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Desktop/衡截图-\(Self.stamp()).png")
+      try? data.write(to: dst)
+    }
+  }
+
+  /// 下载：抓图后选择文件夹，文件名 yyyyMMddHHmmssSSS.png
+  private func saveToFolder(_ rect: NSRect, from view: SelectionView) {
+    guard active, let screen = view.window?.screen else { cancel(); return }
+    grab(rect, screen: screen, windowID: view.windowIDForCapture) { [weak self] data in
+      guard let self else { return }
+      guard let data else { NSSound.beep(); self.showAll(); return }
+      let panel = NSOpenPanel()
+      panel.canChooseFiles = false
+      panel.canChooseDirectories = true
+      panel.allowsMultipleSelection = false
+      panel.canCreateDirectories = true
+      panel.prompt = "保存到此处"
+      panel.message = "选择保存截图的文件夹"
+      let ok = panel.runModal() == .OK
+      let dir = panel.url
+      // 面板里点了取消：回到覆盖窗，保留选区继续调整
+      guard ok, let dir else { self.showAll(); return }
+      self.close()
+      let dst = dir.appendingPathComponent("\(Self.stamp()).png")
+      do { try data.write(to: dst) } catch { NSSound.beep() }
+    }
+  }
+}
+
+/// 选区视图：遮罩 + 选区 + 8 个缩放把手 + 尺寸标签 + 提示条 + 工具条
+final class SelectionView: NSView {
+  var onCancel: (() -> Void)?
+  var onConfirm: ((NSRect, SelectionView) -> Void)?
+  var onSave: ((NSRect, SelectionView) -> Void)?
+
+  private var sel: NSRect = .zero
+  private var dragging = false
+  private var dragStart: NSPoint = .zero
+  private var resizeHandle: Int = -1
+  private var moveStart: NSPoint = .zero
+  private var moveOrigin: NSRect = .zero
+  private var selBefore: NSRect = .zero
+  private var track: NSTrackingArea?
+  /// 悬停预览：光标下的应用窗口（未选区时显示）
+  private var hoverRect: NSRect = .zero
+  private var hoverID: CGWindowID = 0
+  /// 本次选区对应的窗口（单击选中窗口时非 0，按 -l 抓整窗）
+  private var selWindowID: CGWindowID = 0
+  var windowIDForCapture: CGWindowID { selWindowID }
+  private var pressAt: NSPoint = .zero
+  private var moved: Bool = false
+
+  override var acceptsFirstResponder: Bool { true }
+  override func becomeFirstResponder() -> Bool { true }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let track { removeTrackingArea(track) }
+    let area = NSTrackingArea(
+      rect: .zero,
+      options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+      owner: self, userInfo: nil)
+    addTrackingArea(area)
+    track = area
+  }
+
+  /// 光标下最上层的普通窗口（排除我们自己的遮罩窗）
+  private func windowUnder(_ p: NSPoint) -> (rect: NSRect, id: CGWindowID)? {
+    guard let screen = window?.screen else { return nil }
+    let list = CGWindowListCopyWindowInfo(
+      [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    let mainH = CGDisplayBounds(CGMainDisplayID()).height
+    let myPID = Int(getpid())
+    for info in list ?? [] {
+      guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+      guard let pid = info[kCGWindowOwnerPID as String] as? Int, pid != myPID else { continue }
+      guard let alpha = info[kCGWindowAlpha as String] as? Double, alpha > 0.05 else { continue }
+      guard let dict = info[kCGWindowBounds as String] as? NSDictionary,
+            let g = CGRect(dictionaryRepresentation: dict)
+      else { continue }
+      if g.width < 40 || g.height < 40 { continue }
+      // 全局左上 → AppKit 左下 → 视图坐标
+      let ay = mainH - g.minY - g.height
+      let rect = NSRect(
+        x: g.minX - screen.frame.origin.x,
+        y: ay - screen.frame.origin.y,
+        width: g.width, height: g.height)
+      if rect.contains(p) {
+        return (rect, CGWindowID(info[kCGWindowNumber as String] as? UInt32 ?? 0))
+      }
+    }
+    return nil
+  }
+
+  private func diagonal(_ name: String) -> NSCursor {
+    if let c = NSCursor.perform(NSSelectorFromString(name))?.takeUnretainedValue() as? NSCursor {
+      return c
+    }
+    return NSCursor.resizeLeftRight
+  }
+
+  private func updateCursor(_ p: NSPoint) {
+    guard sel.width > 4, sel.height > 4 else { NSCursor.crosshair.set(); return }
+    let tb = toolbar()
+    if tb.cancel.insetBy(dx: -4, dy: -4).contains(p)
+      || tb.save.insetBy(dx: -4, dy: -4).contains(p)
+      || tb.confirm.insetBy(dx: -4, dy: -4).contains(p) {
+      NSCursor.pointingHand.set()
+      return
+    }
+    if let idx = handles().enumerated().first(where: { $0.element.insetBy(dx: -6, dy: -6).contains(p) })?.offset {
+      switch idx {
+      case 0, 7: diagonal("_windowResizeNorthWestSouthEastCursor").set()
+      case 2, 5: diagonal("_windowResizeNorthEastSouthWestCursor").set()
+      case 1, 6: NSCursor.resizeUpDown.set()
+      case 3, 4: NSCursor.resizeLeftRight.set()
+      default: NSCursor.crosshair.set()
+      }
+      return
+    }
+    if sel.contains(p) { NSCursor.openHand.set(); return }
+    NSCursor.crosshair.set()
+  }
+
+  override func mouseMoved(with event: NSEvent) {
+    let p = convert(event.locationInWindow, from: nil)
+    updateCursor(p)
+    // 已有选区就不再预览窗口
+    if sel.width > 4, sel.height > 4 { return }
+    if let hit = windowUnder(p) {
+      if hit.rect != hoverRect || hit.id != hoverID {
+        hoverRect = hit.rect
+        hoverID = hit.id
+        HengWindowRenderer.log("HOVER id=\(hit.id) rect=\(hit.rect)")
+        needsDisplay = true
+      }
+    } else if hoverID != 0 || hoverRect != .zero {
+      hoverRect = .zero
+      hoverID = 0
+      needsDisplay = true
+    }
+  }
+
+  /// 工具条：三个按钮（取消 / 保存 / 确认），右边缘与选区右边缘齐平、位于选区下方外侧
+  private func toolbar() -> (bg: NSRect, cancel: NSRect, save: NSRect, confirm: NSRect) {
+    let bh: CGFloat = 36
+    let d: CGFloat = 28
+    let gap: CGFloat = 8
+    let inset: CGFloat = 7
+    let bw: CGFloat = inset * 2 + d * 3 + gap * 2
+    let vgap: CGFloat = 10
+    var x = sel.maxX - bw
+    var y = sel.minY - bh - vgap
+    if y < bounds.minY + 8 { y = sel.maxY + vgap }
+    x = max(bounds.minX + 8, min(x, bounds.maxX - bw - 8))
+    y = max(bounds.minY + 8, min(y, bounds.maxY - bh - 8))
+    let bg = NSRect(x: x, y: y, width: bw, height: bh)
+    let cancel = NSRect(x: bg.minX + inset, y: bg.midY - d / 2, width: d, height: d)
+    let save = NSRect(x: cancel.maxX + gap, y: bg.midY - d / 2, width: d, height: d)
+    let confirm = NSRect(x: save.maxX + gap, y: bg.midY - d / 2, width: d, height: d)
+    return (bg, cancel, save, confirm)
+  }
+
+  private var closeBox: NSRect {
+    NSRect(x: bounds.maxX - 56, y: bounds.maxY - 56, width: 40, height: 40)
+  }
+
+  private func handles() -> [NSRect] {
+    guard sel.width > 2, sel.height > 2 else { return [] }
+    let s: CGFloat = 8
+    let r = sel
+    let pts = [
+      NSPoint(x: r.minX, y: r.maxY), NSPoint(x: r.midX, y: r.maxY), NSPoint(x: r.maxX, y: r.maxY),
+      NSPoint(x: r.minX, y: r.midY), NSPoint(x: r.maxX, y: r.midY),
+      NSPoint(x: r.minX, y: r.minY), NSPoint(x: r.midX, y: r.minY), NSPoint(x: r.maxX, y: r.minY),
+    ]
+    return pts.map { NSRect(x: $0.x - s / 2, y: $0.y - s / 2, width: s, height: s) }
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    let p = convert(event.locationInWindow, from: nil)
+    if closeBox.contains(p) { onCancel?(); return }
+    if sel.width > 4, sel.height > 4 {
+      let tb = toolbar()
+      if tb.cancel.insetBy(dx: -4, dy: -4).contains(p) { onCancel?(); return }
+      if tb.save.insetBy(dx: -4, dy: -4).contains(p) { onSave?(sel, self); return }
+      if tb.confirm.insetBy(dx: -4, dy: -4).contains(p) { onConfirm?(sel, self); return }
+      for (i, hnd) in handles().enumerated() where hnd.insetBy(dx: -6, dy: -6).contains(p) {
+        resizeHandle = i
+        moveStart = p
+        moveOrigin = sel
+        return
+      }
+      if sel.contains(p) {
+        resizeHandle = 8
+        moveStart = p
+        moveOrigin = sel
+        NSCursor.closedHand.set()
+        return
+      }
+      return  // 已有选区：本次会话不再新建
+    }
+    resizeHandle = -1
+    dragging = true
+    dragStart = p
+    selBefore = sel
+    sel = NSRect(origin: p, size: .zero)
+    pressAt = p
+    moved = false
+    needsDisplay = true
+  }
+
+  override func mouseDragged(with event: NSEvent) {
+    let p = convert(event.locationInWindow, from: nil)
+    if dragging, abs(p.x - pressAt.x) > 1.5 || abs(p.y - pressAt.y) > 1.5 {
+      moved = true
+      hoverRect = .zero
+      hoverID = 0
+    }
+    if resizeHandle == -1, dragging {
+      sel = NSRect(
+        x: min(dragStart.x, p.x), y: min(dragStart.y, p.y),
+        width: abs(p.x - dragStart.x), height: abs(p.y - dragStart.y))
+    } else if resizeHandle == 8 {
+      sel = moveOrigin.offsetBy(dx: p.x - moveStart.x, dy: p.y - moveStart.y)
+    } else if resizeHandle >= 0 {
+      var r = moveOrigin
+      let dx = p.x - moveStart.x
+      let dy = p.y - moveStart.y
+      switch resizeHandle {
+      case 0: r.origin.x += dx; r.size.width -= dx; r.size.height += dy
+      case 1: r.size.height += dy
+      case 2: r.size.width += dx; r.size.height += dy
+      case 3: r.origin.x += dx; r.size.width -= dx
+      case 4: r.size.width += dx
+      case 5: r.origin.x += dx; r.size.width -= dx; r.origin.y += dy; r.size.height -= dy
+      case 6: r.origin.y += dy; r.size.height -= dy
+      case 7: r.size.width += dx; r.origin.y += dy; r.size.height -= dy
+      default: break
+      }
+      if r.size.width > 1, r.size.height > 1 { sel = r }
+    }
+    needsDisplay = true
+  }
+
+  override func mouseUp(with event: NSEvent) {
+    let wasDragging = dragging
+    dragging = false
+    resizeHandle = -1
+    if wasDragging && !moved && hoverRect.width > 4 {
+      // 单击（没拖）：直接选中悬停的应用窗口
+      sel = hoverRect
+      selWindowID = hoverID
+    } else if sel.width < 4 || sel.height < 4 {
+      sel = selBefore
+      selWindowID = 0
+    } else {
+      selWindowID = 0
+    }
+    needsDisplay = true
+  }
+
+  override func rightMouseDown(with event: NSEvent) { onCancel?() }
+
+  override func keyDown(with event: NSEvent) {
+    // 方向键微调：左右只动右边框，上下只动下边框（左下角固定）
+    // 步长按屏幕缩放折算 —— 一次 = 一个物理像素
+    let scale = max(window?.backingScaleFactor ?? 1, 1)
+    // 默认一次挪 5 个物理像素；按住 Shift 变 1 像素做精修
+    let step = (event.modifierFlags.contains(.shift) ? 1.0 : 5.0) / scale
+    switch event.keyCode {
+    case 123:  // ←
+      guard sel.width > step else { return }
+      sel.size.width -= step
+      needsDisplay = true
+    case 124:  // →
+      sel.size.width += step
+      HengWindowRenderer.log("SHOT nudge step=\(step) size=\(Int(sel.width))x\(Int(sel.height))")
+      needsDisplay = true
+    case 125:  // ↓：下边框下移（顶边固定）
+      sel.origin.y -= step
+      sel.size.height += step
+      needsDisplay = true
+    case 126:  // ↑：下边框上移（顶边固定）
+      guard sel.height > step else { return }
+      sel.origin.y += step
+      sel.size.height -= step
+      needsDisplay = true
+    case 53: onCancel?()
+    case 36, 76: if sel.width > 4, sel.height > 4 { onConfirm?(sel, self) }
+    default: super.keyDown(with: event)
+    }
+  }
+
+  override func cancelOperation(_ sender: Any?) { onCancel?() }
+
+  override func draw(_ dirtyRect: NSRect) {
+    // 还没选区：完全不铺遮罩，只有悬停窗口的描边
+    if sel.width <= 4 || sel.height <= 4 {
+      if hoverRect.width > 4 {
+        NSColor(red: 0.29, green: 0.56, blue: 1.0, alpha: 1).setStroke()
+        let hp = NSBezierPath(rect: hoverRect)
+        hp.lineWidth = 2
+        hp.stroke()
+      }
+    } else {
+      NSColor.black.withAlphaComponent(0.45).setFill()
+      bounds.fill()
+      NSGraphicsContext.saveGraphicsState()
+      NSGraphicsContext.current?.compositingOperation = .clear
+      sel.fill()
+      NSGraphicsContext.restoreGraphicsState()
+
+      NSColor.white.setStroke()
+      let border = NSBezierPath(rect: sel)
+      border.lineWidth = 1
+      border.stroke()
+      NSColor.white.setFill()
+      for hnd in handles() { hnd.fill() }
+
+      let label = "\(Int(sel.width)) × \(Int(sel.height))"
+      let attrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+        .foregroundColor: NSColor.white,
+      ]
+      let size = (label as NSString).size(withAttributes: attrs)
+      var lx = sel.midX - size.width / 2
+      var ly = sel.maxY + 6
+      if ly + size.height > bounds.maxY { ly = sel.minY - size.height - 6 }
+      lx = min(max(lx, bounds.minX + 4), bounds.maxX - size.width - 4)
+      if ly < bounds.minY { ly = bounds.minY + 4 }
+      let box = NSRect(x: lx - 6, y: ly - 2, width: size.width + 12, height: size.height + 4)
+      NSColor.black.withAlphaComponent(0.6).setFill()
+      NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill()
+      (label as NSString).draw(at: NSPoint(x: lx, y: ly), withAttributes: attrs)
+
+      // 工具条：深色底 + 三个纯笔画图标
+      let tb = toolbar()
+      NSColor(white: 0.12, alpha: 0.92).setFill()
+      NSBezierPath(roundedRect: tb.bg, xRadius: 8, yRadius: 8).fill()
+
+      let red = NSColor(red: 1.0, green: 0.32, blue: 0.28, alpha: 1)
+      let green = NSColor(red: 0.30, green: 0.85, blue: 0.45, alpha: 1)
+      let white = NSColor(white: 0.92, alpha: 1)
+
+      // ✕
+      let cx = tb.cancel.midX, cy = tb.cancel.midY
+      let cross = NSBezierPath()
+      cross.lineWidth = 2.4
+      cross.lineCapStyle = .round
+      cross.move(to: NSPoint(x: cx - 5, y: cy - 5))
+      cross.line(to: NSPoint(x: cx + 5, y: cy + 5))
+      cross.move(to: NSPoint(x: cx - 5, y: cy + 5))
+      cross.line(to: NSPoint(x: cx + 5, y: cy - 5))
+      red.setStroke()
+      cross.stroke()
+
+      // ⤓ 下载（箭头 + 托盘）
+      let sx = tb.save.midX, sy = tb.save.midY
+      let dl = NSBezierPath()
+      dl.lineWidth = 2.2
+      dl.lineCapStyle = .round
+      dl.lineJoinStyle = .round
+      dl.move(to: NSPoint(x: sx, y: sy + 7))
+      dl.line(to: NSPoint(x: sx, y: sy - 3))
+      dl.move(to: NSPoint(x: sx - 4, y: sy + 1))
+      dl.line(to: NSPoint(x: sx, y: sy - 3))
+      dl.line(to: NSPoint(x: sx + 4, y: sy + 1))
+      dl.move(to: NSPoint(x: sx - 6.5, y: sy - 7))
+      dl.line(to: NSPoint(x: sx + 6.5, y: sy - 7))
+      white.setStroke()
+      dl.stroke()
+
+      // ✓
+      let gx = tb.confirm.midX, gy = tb.confirm.midY
+      let tick = NSBezierPath()
+      tick.lineWidth = 2.6
+      tick.lineCapStyle = .round
+      tick.lineJoinStyle = .round
+      tick.move(to: NSPoint(x: gx - 6, y: gy))
+      tick.line(to: NSPoint(x: gx - 1.5, y: gy - 5))
+      tick.line(to: NSPoint(x: gx + 6.5, y: gy + 5))
+      green.setStroke()
+      tick.stroke()
+    }
+
+    let hint = "拖动选区 · 回车确认 · Esc / 右键取消"
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: NSFont.systemFont(ofSize: 13),
+      .foregroundColor: NSColor.white,
+    ]
+    let hs = (hint as NSString).size(withAttributes: attrs)
+    let hx = bounds.midX - hs.width / 2
+    let hy = bounds.maxY - 44
+    NSColor.black.withAlphaComponent(0.55).setFill()
+    NSBezierPath(
+      roundedRect: NSRect(x: hx - 10, y: hy - 6, width: hs.width + 20, height: hs.height + 12),
+      xRadius: 6, yRadius: 6
+    ).fill()
+    (hint as NSString).draw(at: NSPoint(x: hx, y: hy), withAttributes: attrs)
+
+    NSColor.black.withAlphaComponent(0.55).setFill()
+    NSBezierPath(ovalIn: closeBox).fill()
+    let xa: [NSAttributedString.Key: Any] = [
+      .font: NSFont.systemFont(ofSize: 18, weight: .semibold),
+      .foregroundColor: NSColor.white,
+    ]
+    let xs = ("✕" as NSString).size(withAttributes: xa)
+    ("✕" as NSString).draw(
+      at: NSPoint(x: closeBox.midX - xs.width / 2, y: closeBox.midY - xs.height / 2),
+      withAttributes: xa)
+  }
 }

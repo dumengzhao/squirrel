@@ -254,6 +254,29 @@
         }
       }
     },
+    "Screenshot" : {
+      "comment" : "Menu item",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Screenshot"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "截图"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "截圖"
+          }
+        }
+      }
+    },
     "Symbols" : {
       "comment" : "Menu item",
       "localizations" : {
@@ -290,6 +313,29 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "同步用戶資料"
+          }
+        }
+      }
+    },
+    "Virtual Keyboard" : {
+      "comment" : "Menu item",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Virtual Keyboard"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "软键盘"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "軟鍵盤"
           }
         }
       }

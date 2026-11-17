@@ -22,6 +22,110 @@ final class SquirrelInputController: IMKInputController {
   // 点击从主线程发给 core UI 线程后，core 要跨两轮循环才产出 commit，
   // 比主线程的下一轮晚约 9ms，所以在 mouseUp 里取必定取空（实测 nil）。
   // core 在文本就绪的同一刻回调，时序天然正确。
+  /// 软键盘点击：core 转交过来，按真实按键处理（内联预编辑 / 光标锚点同一条链）
+  private func observeSoftKeyboard() {
+    softKeyObserver = NotificationCenter.default.addObserver(
+      forName: .hengSoftKey, object: nil, queue: .main
+    ) { [weak self] note in
+      guard let self,
+            let s = note.userInfo?["session"] as? UInt64,
+            let ks = note.userInfo?["ks"] as? Int32,
+            let mask = note.userInfo?["mask"] as? Int32 else { return }
+      // 会话号对不上（换输入框后旧 session 已销毁、或激活顺序错位）时，
+      // 投给最近激活的控制器，避免软键盘整片失效。
+      guard s == self.session || self === Self.lastActive else { return }
+      // 键盘自带功能键：截屏 / 中英（-6 / -8，由 core 下发）
+      if ks == -6 {
+        // 自绘覆盖窗：拖拽选区 / 缩放把手 / 回车确认 / Esc·右键·✕ 取消
+        ScreenshotOverlay.shared.begin()
+        return
+      }
+      if ks == -8 {
+        hengSetOption(self.session, "ascii_mode", !hengGetOption(self.session, "ascii_mode"))
+        self.rimeUpdate()
+        return
+      }
+      // 带 ⌃/⌥/⌘ 的按键：合成带修饰的真实按键（⌘C、⌃A 等组合才到得了宿主）
+      if SoftKey.postCombo(ks, mask: mask) { return }
+      // ⇪ 打开时与物理 CapsLock 同语义：不组字、直接把大写字母送到宿主，
+      // 否则 rime 会把它当普通字母起一次组字，候选窗就冒出来了。
+      if mask & (1 << 1) != 0, let scalar = UnicodeScalar(UInt32(ks)),
+         (65...90).contains(ks) || (97...122).contains(ks) {
+        client?.insertText(
+          String(Character(scalar)).uppercased(),
+          replacementRange: NSRange(location: NSNotFound, length: 0))
+        return
+      }
+      // 功能键（回车/退格/删除/方向/翻页…）合成一次真实按键事件：完整走
+      // 「键盘事件 → IME → 宿主」链路，组字、上屏、光标移动与物理键盘一致。
+      if SoftKey.post(ks) { return }
+      let handled = self.processKey(UInt32(bitPattern: ks), modifiers: UInt32(bitPattern: mask))
+      self.rimeUpdate()
+      // 软键盘没法像物理键那样「返回 false 交回宿主」，rime 不吃的键要自己转成
+      // 标准编辑命令，否则 Del / 方向键 / Tab 这类到了这里就静默消失。
+      if !handled && self.preedit.isEmpty {
+        self.dispatchUnhandledKey(ks)
+      }
+    }
+  }
+
+  /// rime 没消费的功能键 → 走 IMK 标准编辑命令交给宿主
+  private func dispatchUnhandledKey(_ ks: Int32) {
+    if !softKeyTrustLogged {
+      softKeyTrustLogged = true
+      HengWindowRenderer.log("SOFTKEY trusted=\(AXIsProcessTrusted())")
+    }
+    guard let client else { return }
+    let sel: Selector?
+    switch ks {
+    case 0xFFFF: sel = Selector(("deleteForward:"))
+    case 0xFF08: sel = Selector(("deleteBackward:"))
+    case 0xFF51: sel = Selector(("moveLeft:"))
+    case 0xFF52: sel = Selector(("moveUp:"))
+    case 0xFF53: sel = Selector(("moveDown:"))
+    case 0xFF54: sel = Selector(("moveRight:"))
+    case 0xFF09: sel = Selector(("insertTab:"))
+    case 0xFF0D: sel = Selector(("insertNewline:"))
+    case 0xFF1B: sel = Selector(("cancelOperation:"))
+    case 0xFF50: sel = Selector(("moveToBeginningOfLine:"))
+    case 0xFF57: sel = Selector(("moveToEndOfLine:"))
+    case 0xFF55: sel = Selector(("pageUp:"))
+    case 0xFF56: sel = Selector(("pageDown:"))
+    // Ins 在 macOS 上没有对应编辑命令；原来映射成 insertText: 并传 nil，
+    // 会把输入上下文搞坏（之后退格、插入全失效），这里直接不处理。
+    default: sel = nil
+    }
+    if sel == nil {
+      // 可打印 ASCII（数字行、符号、字母）：rime 没消费就直接插入字符
+      let printable = ks >= 0x20 && ks <= 0x7E
+      HengWindowRenderer.log("SOFTKEY dispatch ks=\(ks) printable=\(printable) client=\(client != nil)")
+      if printable, let scalar = UnicodeScalar(UInt32(ks)) {
+        client.insertText(
+          String(Character(scalar)),
+          replacementRange: NSRange(location: NSNotFound, length: 0))
+        HengWindowRenderer.log("SOFTKEY inserted '\(Character(scalar))'")
+      }
+      return
+    }
+    guard let sel else { return }
+    // AppKit 文本视图：走 NSTextInputClient 的标准命令通路（不需要辅助功能权限）
+    if let tic = client as? NSTextInputClient {
+      tic.doCommand(by: sel)
+      if ks == 0xFF0D {
+        client.insertText("\u{000A}", replacementRange: NSRange(location: NSNotFound, length: 0))
+      }
+      return
+    }
+    let obj = client as AnyObject
+    if obj.responds(to: sel) {
+      obj.perform(sel, with: nil)
+    }
+    // 回车/制表符再补一手纯文本插入：部分宿主只认这个
+    let none = NSRange(location: NSNotFound, length: 0)
+    if ks == 0xFF0D { client.insertText("\u{000A}", replacementRange: none) }
+    if ks == 0xFF09 { client.insertText("\u{0009}", replacementRange: none) }
+  }
+
   private func observeCandidateClick() {
     candidateClickObserver = NotificationCenter.default.addObserver(
       forName: .hengCoreCommitReady, object: nil, queue: .main
@@ -148,6 +252,8 @@ final class SquirrelInputController: IMKInputController {
   /// 点选候选后由 HengWindowRenderer 派发：core UI 线程已处理完点击，
   /// 此时取走上屏文本。点击路径没有按键事件伴随，不靠 rimeUpdate 触发。
   private var candidateClickObserver: NSObjectProtocol?
+  private var softKeyObserver: NSObjectProtocol?
+  private var softKeyTrustLogged = false
 
   // swiftlint:disable:next cyclomatic_complexity
   override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
@@ -345,9 +451,13 @@ final class SquirrelInputController: IMKInputController {
   }
 
   override func activateServer(_ sender: Any!) {
+    Self.lastActive = self
     self.client ?= sender as? IMKTextInput
     // 工具窗（表情/符号）上屏按焦点会话投递：core 只认「最近用过的会话」，
     // 焦点换到别的应用后字符会落到上一处。会话句柄只有壳侧有。
+    // 会话是惰性创建的（第一次按键才建）。软键盘的上屏依赖「当前焦点会话」，
+    // 只点软键盘不打字时这里还是 0 → 键全部落空。激活时就建好。
+    if session == 0 { createSession() }
     if session != 0 { heng_ui_set_active_session(session) }
     // 焦点落下时就把前台 app 记好：`recognizedEvents` 不认领按键时
     // handle() 可能一次都不被调用，事件层接管那边只能靠这里维护的 currentApp。
@@ -393,6 +503,8 @@ final class SquirrelInputController: IMKInputController {
     createSession()
     observeCandidateClick()
     hengRegisterCommitHandler()
+    hengRegisterKeyHandler()
+    observeSoftKeyboard()
 
     NotificationCenter.default.addObserver(
       forName: .init("SquirrelSetASCIIModeNotification"),
@@ -611,6 +723,12 @@ final class SquirrelInputController: IMKInputController {
     let symbols = NSMenuItem(title: NSLocalizedString("Symbols", comment: "Menu item"),
                              action: #selector(openSymbols), keyEquivalent: "")
     symbols.target = self
+    let vkbdItem = NSMenuItem(title: NSLocalizedString("Virtual Keyboard", comment: "Menu item"),
+                              action: #selector(toggleVkbd), keyEquivalent: "")
+    vkbdItem.target = self
+    let shotItem = NSMenuItem(title: NSLocalizedString("Screenshot", comment: "Menu item"),
+                              action: #selector(takeScreenshot), keyEquivalent: "")
+    shotItem.target = self
 
     let setting = NSMenuItem(title: NSLocalizedString("Settings...", comment: "Menu item"),
                              action: #selector(openSettings), keyEquivalent: "")
@@ -626,6 +744,8 @@ final class SquirrelInputController: IMKInputController {
     menu.addItem(setting)
     menu.addItem(emoji)
     menu.addItem(symbols)
+    menu.addItem(vkbdItem)
+    menu.addItem(shotItem)
     menu.addItem(about)
     menu.addItem(update)
 
@@ -642,6 +762,14 @@ final class SquirrelInputController: IMKInputController {
 
   @objc func openSymbols() {
     _ = heng_symbols_show()
+  }
+
+  @objc func toggleVkbd() {
+    _ = heng_vkbd_toggle()
+  }
+
+  @objc func takeScreenshot() {
+    ScreenshotOverlay.shared.begin()
   }
 
   @objc func openAbout() {
@@ -670,6 +798,9 @@ final class SquirrelInputController: IMKInputController {
 
   deinit {
     if let obs = candidateClickObserver {
+      NotificationCenter.default.removeObserver(obs)
+    }
+    if let obs = softKeyObserver {
       NotificationCenter.default.removeObserver(obs)
     }
     destroySession()
