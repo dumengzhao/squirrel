@@ -740,12 +740,17 @@ final class SquirrelInputController: IMKInputController {
                             action: #selector(checkForUpdates), keyEquivalent: "")
     update.target = self
 
+    // 分组：设置 | 表情/符号 | 软键盘 | 截图 | 关于/检查更新
     let menu = NSMenu()
     menu.addItem(setting)
+    menu.addItem(.separator())
     menu.addItem(emoji)
     menu.addItem(symbols)
+    menu.addItem(.separator())
     menu.addItem(vkbdItem)
+    menu.addItem(.separator())
     menu.addItem(shotItem)
+    menu.addItem(.separator())
     menu.addItem(about)
     menu.addItem(update)
 

@@ -47,7 +47,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "检查新版本..."
+            "value" : "检查更新"
           }
         },
         "zh-Hant" : {
@@ -226,7 +226,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "用户设定..."
+            "value" : "输入法设置"
           }
         },
         "zh-Hant" : {

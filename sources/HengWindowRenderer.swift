@@ -504,7 +504,6 @@ final class HengWindowRenderer: NSObject {
     // 只写一次，不影响性能。
     if !Self.dumpedWindows.contains(win) {
       Self.dumpedWindows.insert(win)
-      Self.dumpFrame(win: win, img: img, w: pixelW, h: pixelH)
     }
   }
 
@@ -515,32 +514,6 @@ final class HengWindowRenderer: NSObject {
   /// 直接给 CGDataProvider 用会被下一帧覆写 → 画面撕裂/空白。
   /// 这里按窗口各存一份拷贝，CGImage 的生命周期就与 core 解耦。
   private static var frameBuffers: [Int: (ptr: UnsafeMutableRawPointer, allocated: Int)] = [:]
-
-  /// 把 CGImage 写成二进制 PPM。只取 alpha 合成后的 RGB（白底），
-  /// 便于在无 GUI 环境里直接看 core 渲染成了什么样。
-  private static func dumpFrame(win: Int, img: CGImage, w: Int, h: Int) {
-    var pixels = [UInt8](repeating: 0, count: w * h * 4)
-    guard let ctx = CGContext(
-      data: &pixels, width: w, height: h, bitsPerComponent: 8,
-      bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
-      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-    else { return }
-    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
-    var out = Data("P6\n\(w) \(h)\n255\n".utf8)
-    out.reserveCapacity(out.count + w * h * 3)
-    let bytes = [UInt8](pixels)
-    for i in stride(from: 0, to: w * h, by: 1) {
-      let a = Int(bytes[i * 4 + 3])
-      // 白底合成：透明像素显示为白，方便看真实观感
-      let r = (Int(bytes[i * 4]) * a + 255 * (255 - a)) / 255
-      let g = (Int(bytes[i * 4 + 1]) * a + 255 * (255 - a)) / 255
-      let b = (Int(bytes[i * 4 + 2]) * a + 255 * (255 - a)) / 255
-      out.append(UInt8(min(255, r))); out.append(UInt8(min(255, g))); out.append(UInt8(min(255, b)))
-    }
-    let path = "/tmp/heng-dump-w\(win).ppm"
-    try? out.write(to: URL(fileURLWithPath: path))
-    Self.log("DUMP win=\(win) -> \(path) \(w)x\(h)")
-  }
 
   /// 用 CGWindowList 反查我们这个 panel 在系统眼里的真实状态。
   /// AppKit 说 visible=true 但用户看不见时，只有系统列表能给出裁决。
@@ -761,7 +734,7 @@ final class HengOverlayPanel: NSPanel {
 // MARK: - 区域截图（自绘覆盖窗 + 两级工具条 + 注释）
 
 enum ShotTool: Int {
-  case pen = 0, arrow, rect, ellipse, line, mosaicBrush, mosaicRect
+  case pen = 0, arrow, rect, ellipse, line, mosaicBrush, mosaicRect, text
 
   var isMosaic: Bool { self == .mosaicBrush || self == .mosaicRect }
 }
@@ -778,6 +751,10 @@ struct Annotation {
   var block: CGFloat = 12
   /// true = 高斯模糊，false = 像素化
   var blur: Bool = false
+  /// 文字内容 / 字号 / 底色（nil = 不填充）
+  var text: String = ""
+  var fontSize: CGFloat = 50
+  var fillColor: NSColor? = nil
 }
 
 /// 马赛克注释的裁剪路径（涂抹=轨迹描边，框选=矩形）
@@ -843,6 +820,26 @@ func drawAnnotation(_ a: Annotation) {
     path.move(to: a.points[0])
     path.line(to: a.points[1])
     path.stroke()
+  case .text:
+    guard !a.text.isEmpty else { return }
+    let font = NSFont.systemFont(ofSize: max(12, a.fontSize), weight: .regular)
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: font, .foregroundColor: a.color,
+    ]
+    let str = a.text as NSString
+    let size = str.size(withAttributes: attrs)
+    let pad: CGFloat = 4
+    let origin = a.points[0]
+    if let fill = a.fillColor {
+      fill.setFill()
+      NSBezierPath(roundedRect: NSRect(
+        x: origin.x, y: origin.y - size.height - pad * 2,
+        width: size.width + pad * 2, height: size.height + pad * 2),
+        xRadius: 2, yRadius: 2).fill()
+    }
+    str.draw(
+      at: NSPoint(x: origin.x + pad, y: origin.y - size.height - pad),
+      withAttributes: attrs)
   case .mosaicBrush, .mosaicRect:
     return  // 由马赛克滤镜单独处理
   case .arrow:
@@ -882,30 +879,12 @@ final class ScreenshotOverlay: NSObject {
   private var watchdog: Timer?
   var isActive: Bool { active }
 
-  private static let openClock = Date()
-  static func openMark(_ tag: String) {
-    #if DEBUG
-    let t = Date().timeIntervalSince(openClock) * 1000
-    let line = String(format: "%7.1fms  %@\n", t, tag)
-    let p = "/tmp/heng-open.log"
-    if let h = FileHandle(forWritingAtPath: p) {
-      h.seekToEndOfFile()
-      h.write(line.data(using: .utf8)!)
-      try? h.close()
-    } else {
-      try? line.write(toFile: p, atomically: true, encoding: .utf8)
-    }
-    #endif
-  }
-
   func begin() {
     // 上一轮如果没收干净，先关掉，避免两套覆盖窗同时存在
     if active || !windows.isEmpty {
-      Self.openMark("stale session -> close")
-      close()
+        close()
     }
     active = true
-    Self.openMark("begin")
     let screens = NSScreen.screens
     var bases = [NSImage?](repeating: nil, count: screens.count)
     let useSCK: Bool
@@ -922,7 +901,6 @@ final class ScreenshotOverlay: NSObject {
         bases[0] = Self.captureScreen(only)
       }
     }
-    Self.openMark("capture-path decided")
     var captured: [(NSScreen, SelectionView)] = []
     for (idx, screen) in screens.enumerated() {
       let base = bases[idx]
@@ -947,13 +925,10 @@ final class ScreenshotOverlay: NSObject {
       win.contentView = view
       win.makeKeyAndOrderFront(nil)
       windows.append(win)
-      Self.openMark("window \(idx) shown")
     }
-    Self.openMark("before activate")
     NSApp.activate(ignoringOtherApps: true)
     windows.first?.makeKey()
     windows.first?.makeFirstResponder(windows.first?.contentView)
-    Self.openMark("after activate")
     watchdog = Timer.scheduledTimer(withTimeInterval: 180, repeats: false) { [weak self] _ in
       self?.cancel()
     }
@@ -967,7 +942,6 @@ final class ScreenshotOverlay: NSObject {
             if let img = await Self.captureExcludingSelf(screen) {
               await MainActor.run {
                 view.setBaseImage(img)
-                Self.openMark("base image ready")
               }
             }
           }
@@ -983,10 +957,8 @@ final class ScreenshotOverlay: NSObject {
       NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
     let displayID = CGDirectDisplayID(num.uint32Value)
     do {
-      Self.openMark("sck: content begin")
       let content = try await SCShareableContent.excludingDesktopWindows(
         false, onScreenWindowsOnly: true)
-      Self.openMark("sck: content ok")
       guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
         return nil
       }
@@ -1004,10 +976,8 @@ final class ScreenshotOverlay: NSObject {
       cfg.height = Int(screen.frame.height * scale)
       cfg.showsCursor = false
       cfg.captureResolution = .best
-      Self.openMark("sck: capture begin")
       let cg = try await SCScreenshotManager.captureImage(
         contentFilter: filter, configuration: cfg)
-      Self.openMark("sck: capture ok")
       return NSImage(cgImage: cg, size: screen.frame.size)
     } catch {
       return nil
@@ -1041,7 +1011,6 @@ final class ScreenshotOverlay: NSObject {
     windows.first?.makeFirstResponder(windows.first?.contentView)
   }
   private func close() {
-    Self.openMark("close (\(windows.count) windows)")
     watchdog?.invalidate()
     watchdog = nil
     for w in windows { w.orderOut(nil); w.contentView = nil }
@@ -1088,9 +1057,10 @@ final class ScreenshotOverlay: NSObject {
   }
 
   private func composite(
-    _ data: Data, annotations: [Annotation], sel: NSRect, scale: CGFloat
+    _ data: Data, annotations: [Annotation], sel: NSRect, scale: CGFloat, radius: CGFloat = 0
   ) -> Data? {
-    guard !annotations.isEmpty else { return data }
+    // 没有注释也要走合成：圆角需要在输出图上真的擦角
+    guard !annotations.isEmpty || radius > 0.5 else { return data }
     guard let rep = NSBitmapImageRep(
       bitmapDataPlanes: nil,
       pixelsWide: max(1, Int(sel.width * scale)), pixelsHigh: max(1, Int(sel.height * scale)),
@@ -1109,6 +1079,21 @@ final class ScreenshotOverlay: NSObject {
       }
       else { drawAnnotation(a) }
     }
+    // 圆角：把四个角擦成透明
+    if radius > 0.5 {
+      // 注意：这里已经在 translateBy(-sel.origin) 之后，路径要用视图坐标，
+      // 不能用 (0,0)，否则会擦到图片中间去
+      let r = min(radius, min(sel.width, sel.height) / 2)
+      let box = NSRect(x: sel.minX, y: sel.minY, width: sel.width, height: sel.height)
+      let inner = NSBezierPath(roundedRect: box, xRadius: r, yRadius: r)
+      let ring = NSBezierPath(rect: box)
+      ring.append(inner)
+      ring.windingRule = .evenOdd
+      NSGraphicsContext.current?.compositingOperation = .clear
+      ring.fill()
+      NSGraphicsContext.current?.compositingOperation = .sourceOver
+    }
+
     NSGraphicsContext.restoreGraphicsState()
     return rep.representation(using: .png, properties: [:])
   }
@@ -1187,7 +1172,8 @@ final class ScreenshotOverlay: NSObject {
       guard let self else { return }
       defer { self.cancel() }
       guard let data else { NSSound.beep(); return }
-      let final = self.composite(data, annotations: ann, sel: rect, scale: scale) ?? data
+      let final = self.composite(
+        data, annotations: ann, sel: rect, scale: scale, radius: view.outputCornerRadius) ?? data
       guard let img = NSImage(data: final) else { NSSound.beep(); return }
       let pb = NSPasteboard.general
       pb.clearContents()
@@ -1210,7 +1196,8 @@ final class ScreenshotOverlay: NSObject {
     let handle: (Data?) -> Void = { [weak self] data in
       guard let self else { return }
       guard let data else { NSSound.beep(); self.showAll(); return }
-      let final = self.composite(data, annotations: ann, sel: rect, scale: scale) ?? data
+      let final = self.composite(
+        data, annotations: ann, sel: rect, scale: scale, radius: view.outputCornerRadius) ?? data
       // 覆盖窗在 shielding 级别，不收起的话 NSOpenPanel 会被压在下面看不见
       self.hideAll()
       let panel = NSOpenPanel()
@@ -1236,7 +1223,7 @@ final class ScreenshotOverlay: NSObject {
 }
 
 /// 选区视图：遮罩 + 选区 + 把手 + 一级/二级工具条 + 颜色弹层 + 注释
-final class SelectionView: NSView {
+final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
   var onCancel: (() -> Void)?
   var onConfirm: ((NSRect, SelectionView) -> Void)?
   var onSave: ((NSRect, SelectionView) -> Void)?
@@ -1254,6 +1241,30 @@ final class SelectionView: NSView {
   private var lineWidth: CGFloat = 4
   /// 形状属性二选一：false = 外框（描边），true = 填充（此时粗细禁用）
   private var shapeFilled = false
+
+  // 文字
+  private enum PaletteTarget { case shape, text, fill }
+  private var paletteTarget: PaletteTarget = .shape
+  private var paletteAnchor: NSRect = .zero
+  private var textColor: NSColor = NSColor(red: 1.0, green: 0.27, blue: 0.23, alpha: 1)
+  private var textFill: NSColor? = nil
+  private var fontSize: CGFloat = 50
+  /// 输出圆角（0–100）
+  private var cornerRadius: CGFloat = 0
+  private var radiusDrag = false
+
+  // 宽高输入面板
+  private var showSizeEditor = false
+  private var sizeWField: NSTextField?
+  private var sizeHField: NSTextField?
+
+  private var textEditor: NSTextView?
+  private var textDragIndex: Int?
+  private var textDragStart: NSPoint = .zero
+  private var textDragOrigin: NSPoint = .zero
+  private var editingAnchor: NSPoint = .zero
+  private var editingText = ""
+
   private var showPalette = false
   private var showCustom = false
   private enum CustomDrag { case none, sv, hue }
@@ -1274,6 +1285,7 @@ final class SelectionView: NSView {
   private var hoverID: CGWindowID = 0
   private var selWindowID: CGWindowID = 0
   var windowIDForCapture: CGWindowID { selWindowID }
+  var outputCornerRadius: CGFloat { cornerRadius }
   private var pressAt: NSPoint = .zero
   private var moved = false
   private var tipText: String?
@@ -1347,7 +1359,10 @@ final class SelectionView: NSView {
     let w = inset * 2 + d * 9 + gap * 8 + 8
     var x = sel.maxX - w
     var y = sel.minY - bh - 10
-    if y < bounds.minY + 8 { y = sel.maxY + 10 }
+    if y < bounds.minY + 8 {
+      // 下面放不下：不往上跳，改到选框内部贴底边
+      y = sel.minY + 8
+    }
     y = max(bounds.minY + 8, min(y, bounds.maxY - bh - 8))
     let bg = NSRect(x: x, y: y, width: w, height: bh)
     var cx = bg.minX + inset
@@ -1363,7 +1378,7 @@ final class SelectionView: NSView {
   private func secondaryBar() -> (
     bg: NSRect, items: [NSRect], swatch: NSRect, arrow: NSRect, value: NSRect
   )? {
-    guard let p = primary, p != .text else { return nil }
+    guard let p = primary else { return nil }
     let bh: CGFloat = 34
     let gap: CGFloat = 6
     let inset: CGFloat = 7
@@ -1385,6 +1400,8 @@ final class SelectionView: NSView {
     case .mosaic:
       w = inset * 2 + 2 * (segW + segGap) + groupGap + 2 * (segW + segGap) + groupGap
         + sliderW + gap + valueW
+    case .text:
+      w = inset * 2 + toggleW + gap + toggleW + gap + sliderW + gap + valueW
     default:
       w = inset * 2 + sliderW + gap + valueW + gap + 4 + swatchW + 4 + arrowW
     }
@@ -1416,6 +1433,12 @@ final class SelectionView: NSView {
       }
       items.append(NSRect(x: cx, y: bg.midY - 10, width: sliderW, height: 20)); cx += sliderW + gap
       valueRect = NSRect(x: cx, y: bg.midY - 9, width: valueW, height: 18); cx += valueW
+    case .text:
+      // 字色 / 填充 / 字号
+      items.append(NSRect(x: cx, y: bg.midY - 14, width: toggleW, height: 28)); cx += toggleW + gap
+      items.append(NSRect(x: cx, y: bg.midY - 14, width: toggleW, height: 28)); cx += toggleW + gap
+      items.append(NSRect(x: cx, y: bg.midY - 10, width: sliderW, height: 20)); cx += sliderW + gap
+      valueRect = NSRect(x: cx, y: bg.midY - 9, width: valueW, height: 18); cx += valueW
     default:
       items.append(NSRect(x: cx, y: bg.midY - 10, width: sliderW, height: 20)); cx += sliderW + gap
       valueRect = NSRect(x: cx, y: bg.midY - 9, width: valueW, height: 18); cx += valueW + gap
@@ -1423,7 +1446,7 @@ final class SelectionView: NSView {
 
     var swatch = NSRect.zero
     var arrow = NSRect.zero
-    if p != .mosaic {
+    if p != .mosaic && p != .text {
       let sx = bg.maxX - inset - arrowW - 4 - swatchW
       swatch = NSRect(x: sx, y: bg.midY - swatchW / 2, width: swatchW, height: swatchW)
       arrow = NSRect(x: swatch.maxX + 4, y: bg.midY - 12, width: arrowW, height: 24)
@@ -1457,17 +1480,23 @@ final class SelectionView: NSView {
 
   private let brushSizes: [CGFloat] = [10, 20, 32]
 
+  /// 填充色板多一个「无填充」格子
+  private var paletteCount: Int {
+    paletteTarget == .fill ? presets.count + 2 : presets.count + 1
+  }
+
   private func paletteRect() -> NSRect {
     guard let sb = secondaryBar() else { return .zero }
+    let anchor = paletteAnchor == .zero ? sb.swatch : paletteAnchor
     let cols = 6
     let cell: CGFloat = 24
     let gap: CGFloat = 6
-    let rows = Int(ceil(Double(presets.count + 1) / Double(cols)))
+    let rows = Int(ceil(Double(paletteCount) / Double(cols)))
     let w = CGFloat(cols) * cell + CGFloat(cols - 1) * gap + 16
     let h = CGFloat(rows) * cell + CGFloat(rows - 1) * gap + 16
-    var x = sb.swatch.maxX - w
-    var y = sb.bg.minY - h - 6
-    if y < bounds.minY + 8 { y = sb.bg.maxY + 6 }
+    var x = anchor.maxX - w
+    var y = anchor.minY - h - 6
+    if y < bounds.minY + 8 { y = anchor.maxY + 6 }
     x = max(bounds.minX + 8, x)
     y = max(bounds.minY + 8, y)
     return NSRect(x: x, y: y, width: w, height: h)
@@ -1479,7 +1508,7 @@ final class SelectionView: NSView {
     let cell: CGFloat = 24
     let gap: CGFloat = 6
     var out: [NSRect] = []
-    for i in 0..<(presets.count + 1) {
+    for i in 0..<paletteCount {
       let r = i / cols, c = i % cols
       out.append(NSRect(
         x: pr.minX + 8 + CGFloat(c) * (cell + gap),
@@ -1491,13 +1520,14 @@ final class SelectionView: NSView {
 
   // MARK: 自定义取色（画在同一层遮罩里，不弹独立窗口）
 
-  /// 固定贴工具条右上角向上弹出
+  /// 贴着色板（或工具条）右上角向上弹出
   private func customRect() -> NSRect {
     guard let sb = secondaryBar() else { return .zero }
+    let base = showPalette ? paletteRect() : sb.bg
     let w: CGFloat = 216
     let h: CGFloat = 192
-    let x = max(bounds.minX + 8, sb.bg.maxX - w)
-    let y = min(max(bounds.minY + 8, sb.bg.maxY + 6), bounds.maxY - h - 8)
+    let x = max(bounds.minX + 8, base.maxX - w)
+    let y = min(max(bounds.minY + 8, base.maxY + 6), bounds.maxY - h - 8)
     return NSRect(x: x, y: y, width: w, height: h)
   }
 
@@ -1516,8 +1546,26 @@ final class SelectionView: NSView {
     return NSRect(x: cr.minX + 10, y: cr.minY + 10, width: 22, height: 22)
   }
 
+  /// 当前正在编辑的颜色（按色板目标）
+  private var activeColor: NSColor {
+    get {
+      switch paletteTarget {
+      case .shape: return color
+      case .text: return textColor
+      case .fill: return textFill ?? color
+      }
+    }
+    set {
+      switch paletteTarget {
+      case .shape: color = newValue
+      case .text: textColor = newValue
+      case .fill: textFill = newValue
+      }
+    }
+  }
+
   private func syncCustomFromColor() {
-    let c = color.usingColorSpace(.sRGB) ?? NSColor.white
+    let c = activeColor.usingColorSpace(.sRGB) ?? NSColor.white
     var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
     c.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
     hueValue = max(0, min(1, h)) * 360
@@ -1529,19 +1577,19 @@ final class SelectionView: NSView {
     let sv = customSV()
     satValue = max(0, min(1, (p.x - sv.minX) / max(sv.width, 1)))
     brightValue = max(0, min(1, (p.y - sv.minY) / max(sv.height, 1)))
-    color = NSColor(hue: hueValue / 360, saturation: satValue, brightness: brightValue, alpha: 1)
+    activeColor = NSColor(hue: hueValue / 360, saturation: satValue, brightness: brightValue, alpha: 1)
     needsDisplay = true
   }
 
   private func applyHue(_ p: NSPoint) {
     let hb = customHue()
     hueValue = max(0, min(1, (p.x - hb.minX) / max(hb.width, 1))) * 360
-    color = NSColor(hue: hueValue / 360, saturation: satValue, brightness: brightValue, alpha: 1)
+    activeColor = NSColor(hue: hueValue / 360, saturation: satValue, brightness: brightValue, alpha: 1)
     needsDisplay = true
   }
 
   private func hexString() -> String {
-    let c = color.usingColorSpace(.sRGB) ?? NSColor.white
+    let c = activeColor.usingColorSpace(.sRGB) ?? NSColor.white
     return String(
       format: "#%02X%02X%02X",
       Int(max(0, min(1, c.redComponent)) * 255 + 0.5),
@@ -1554,6 +1602,23 @@ final class SelectionView: NSView {
   override func mouseDown(with event: NSEvent) {
     let p = convert(event.locationInWindow, from: nil)
     setTip(nil, .zero)
+    // 正在编辑时点到输入框外面：这一下只用来"锁定"，不再做别的事
+    if textEditor != nil {
+      finishTextEditing(commit: true)
+      return
+    }
+    if showSizeEditor {
+      if sizeConfirmRect().contains(p) {
+        applySizeEditor()
+        return
+      }
+      if sizeEditorRect().contains(p) {
+        window?.makeFirstResponder(sizeWField)
+        return
+      }
+      closeSizeEditor()
+      return
+    }
     if closeBox.contains(p) { onCancel?(); return }
 
     // 自定义取色优先
@@ -1569,17 +1634,28 @@ final class SelectionView: NSView {
     // 颜色弹层优先
     if showPalette {
       let cells = paletteCells()
+      let customIndex = paletteCount - 1
       for (i, r) in cells.enumerated() where r.contains(p) {
-        if i < presets.count {
-          color = presets[i]
-          showPalette = false
-        } else {
+        if i == customIndex {
           if showCustom {
             showCustom = false
           } else {
             syncCustomFromColor()
             showCustom = true
           }
+        } else if paletteTarget == .fill && i == 0 {
+          textFill = nil
+          showPalette = false
+        } else {
+          let idx = paletteTarget == .fill ? i - 1 : i
+          if idx >= 0 && idx < presets.count {
+            switch paletteTarget {
+            case .shape: color = presets[idx]
+            case .text: textColor = presets[idx]
+            case .fill: textFill = presets[idx]
+            }
+          }
+          showPalette = false
         }
         needsDisplay = true
         return
@@ -1590,6 +1666,18 @@ final class SelectionView: NSView {
     }
 
     if sel.width > 4, sel.height > 4 {
+      // 左上信息条（尺寸 / 圆角）
+      let ib = infoBar()
+      if ib.contains(p) {
+        if infoSliderRect().insetBy(dx: -2, dy: -2).contains(p) {
+          radiusDrag = true
+          applyRadius(p)
+        } else if sizeTextRect().contains(p) {
+          openSizeEditor()
+        }
+        return
+      }
+
       // 涂抹粗细菜单优先
       if showBrushMenu {
         for (i, r) in brushDotRects().enumerated() where r.contains(p) {
@@ -1638,6 +1726,17 @@ final class SelectionView: NSView {
       }
 
       if let t = tool, sel.contains(p) {
+        if t == .text {
+          if let idx = textHit(p) {
+            textDragIndex = idx
+            textDragStart = p
+            textDragOrigin = annotations[idx].points[0]
+            NSCursor.closedHand.set()
+          } else {
+            beginTextEditing(at: p)
+          }
+          return
+        }
         var a = Annotation(
           tool: t, points: [p, p], color: color,
           width: t.isMosaic ? brushSize : lineWidth,
@@ -1677,6 +1776,7 @@ final class SelectionView: NSView {
   }
 
   private func selectPrimary(_ i: Int) {
+    finishTextEditing(commit: true)
     guard let p = Primary(rawValue: i) else { return }
     if primary == p {
       primary = nil
@@ -1687,7 +1787,7 @@ final class SelectionView: NSView {
       case .shape: tool = shapeKind
       case .arrow: tool = .arrow
       case .pen: tool = .pen
-      case .text: tool = nil
+      case .text: tool = .text
       case .mosaic: tool = mosaicBrushMode ? .mosaicBrush : .mosaicRect
       }
     }
@@ -1737,6 +1837,21 @@ final class SelectionView: NSView {
         applyMosaicSlider(p)
       }
       needsDisplay = true
+    } else if primary == .text {
+      switch i {
+      case 0:
+        paletteTarget = .text
+        paletteAnchor = sbRectOf(i)
+        showPalette = true
+      case 1:
+        paletteTarget = .fill
+        paletteAnchor = sbRectOf(i)
+        showPalette = true
+      default:
+        sliderDrag = true
+        applyFontSize(p)
+      }
+      needsDisplay = true
     } else {
       sliderDrag = true
       applySlider(p)
@@ -1748,6 +1863,325 @@ final class SelectionView: NSView {
     if primary == .shape { return sb.items.count > 4 ? sb.items[4] : nil }
     if primary == .mosaic { return sb.items.count > 4 ? sb.items[4] : nil }
     return sb.items.first
+  }
+
+  // MARK: 左上信息条（尺寸 + 圆角）
+
+  private func infoBar() -> NSRect {
+    let h: CGFloat = 30
+    let w: CGFloat = 228
+    let x = max(bounds.minX + 8, min(sel.minX, bounds.maxX - w - 8))
+    // 默认在选区上方（框外），上面放不下才落回选区内部顶端
+    var y = sel.maxY + 8
+    if y + h > bounds.maxY - 8 {
+      y = sel.maxY - h - 8
+    }
+    y = max(bounds.minY + 8, y)
+    return NSRect(x: x, y: y, width: w, height: h)
+  }
+
+  /// 信息条左侧"宽 × 高"文字的可点区域
+  private func sizeTextRect() -> NSRect {
+    let bar = infoBar()
+    return NSRect(x: bar.minX, y: bar.minY, width: 108, height: bar.height)
+  }
+
+  private func sizeEditorRect() -> NSRect {
+    let bar = infoBar()
+    let w: CGFloat = 246
+    let h: CGFloat = 34
+    var x = bar.minX
+    // 优先在信息条上方，上面放不下才落到下方
+    var y = bar.maxY + 6
+    if y + h > bounds.maxY - 8 { y = bar.minY - h - 6 }
+    x = max(bounds.minX + 8, min(x, bounds.maxX - w - 8))
+    y = max(bounds.minY + 8, y)
+    return NSRect(x: x, y: y, width: w, height: h)
+  }
+
+  private func sizeConfirmRect() -> NSRect {
+    let r = sizeEditorRect()
+    return NSRect(x: r.maxX - 8 - 44, y: r.midY - 11, width: 44, height: 22)
+  }
+
+  private func sizeFieldRects() -> (NSRect, NSRect) {
+    let r = sizeEditorRect()
+    let fw: CGFloat = 50
+    let f1 = NSRect(x: r.minX + 30, y: r.midY - 11, width: fw, height: 22)
+    let f2 = NSRect(x: r.minX + 30 + fw + 30, y: r.midY - 11, width: fw, height: 22)
+    return (f1, f2)
+  }
+
+  private func infoSliderRect() -> NSRect {
+    let bar = infoBar()
+    return NSRect(x: bar.maxX - 8 - 26 - 76 - 6, y: bar.midY - 10, width: 76, height: 20)
+  }
+
+  private func infoValueRect() -> NSRect {
+    let bar = infoBar()
+    return NSRect(x: bar.maxX - 8 - 26, y: bar.midY - 9, width: 26, height: 18)
+  }
+
+  /// 选区当前的内轮廓（带圆角）
+  private func innerShape() -> NSBezierPath {
+    let r = min(cornerRadius, min(sel.width, sel.height) / 2)
+    if r <= 0.5 { return NSBezierPath(rect: sel) }
+    return NSBezierPath(roundedRect: sel, xRadius: r, yRadius: r)
+  }
+
+  // MARK: 宽高输入
+
+  private func openSizeEditor() {
+    closeSizeEditor()
+    showSizeEditor = true
+    let (r1, r2) = sizeFieldRects()
+    let wf = makeSizeField(r1, value: "\(Int(sel.width))")
+    let hf = makeSizeField(r2, value: "\(Int(sel.height))")
+    addSubview(wf)
+    addSubview(hf)
+    sizeWField = wf
+    sizeHField = hf
+    wf.nextKeyView = hf
+    hf.nextKeyView = wf
+    window?.recalculateKeyViewLoop()
+    window?.makeFirstResponder(wf)
+    needsDisplay = true
+  }
+
+  private func makeSizeField(_ r: NSRect, value: String) -> NSTextField {
+    let f = NSTextField(frame: r)
+    f.stringValue = value
+    f.isBordered = false
+    f.isBezeled = false
+    f.drawsBackground = true
+    f.backgroundColor = NSColor(white: 0.22, alpha: 1)
+    f.textColor = NSColor(white: 0.96, alpha: 1)
+    f.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+    f.alignment = .center
+    f.focusRingType = .none
+    f.delegate = self
+    f.wantsLayer = true
+    f.layer?.cornerRadius = 4
+    f.target = self
+    f.action = #selector(sizeFieldEnter)
+    return f
+  }
+
+  @objc private func sizeFieldEnter() { applySizeEditor() }
+
+  private func applySizeEditor() {
+    guard let wf = sizeWField, let hf = sizeHField else { return }
+    func num(_ s: String) -> Double? {
+      let t = s.trimmingCharacters(in: .whitespaces)
+      guard !t.isEmpty else { return nil }
+      // 只允许数字和一个小数点（"12"、"12.5" 合法，"12a"、"--1" 不合法）
+      let dots = t.filter { $0 == "." }.count
+      guard dots <= 1, t.allSatisfy({ $0.isNumber || $0 == "." }) else { return nil }
+      return Double(t)
+    }
+    // 格式不对：确认时什么都不做
+    guard let wv = num(wf.stringValue), let hv = num(hf.stringValue) else { return }
+    // 宽或高填 0：直接取消这次截图（不保存、不复制）
+    if wv <= 0 || hv <= 0 {
+      closeSizeEditor()
+      onCancel?()
+      return
+    }
+    var w = CGFloat(wv.rounded())
+    var h = CGFloat(hv.rounded())
+    // 以"左上角"为锚点扩散/收缩：左边界和上边界不动
+    let left = sel.minX
+    let top = sel.maxY
+    w = min(w, bounds.width, bounds.maxX - left)
+    h = min(h, bounds.height, top - bounds.minY)
+    // 太小的选区会让工具条/把手失去意义，最小给到 8
+    w = max(w, 8)
+    h = max(h, 8)
+    sel = NSRect(x: left, y: top - h, width: w, height: h)
+    closeSizeEditor()
+    needsDisplay = true
+  }
+
+  private func closeSizeEditor() {
+    guard showSizeEditor else { return }
+    sizeWField?.removeFromSuperview()
+    sizeHField?.removeFromSuperview()
+    sizeWField = nil
+    sizeHField = nil
+    showSizeEditor = false
+    window?.makeFirstResponder(self)
+    needsDisplay = true
+  }
+
+  func control(
+    _ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector
+  ) -> Bool {
+    if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+      applySizeEditor()
+      return true
+    }
+    if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+      closeSizeEditor()
+      return true
+    }
+    // Tab / Shift+Tab：两个输入框互相跳（不依赖系统的"键盘导航"开关）
+    if commandSelector == #selector(NSResponder.insertTab(_:))
+      || commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+      let next = (control === sizeWField) ? sizeHField : sizeWField
+      window?.makeFirstResponder(next)
+      return true
+    }
+    return false
+  }
+
+  // MARK: 文字编辑
+
+  /// 文字的包围盒（填充块同尺寸）
+  private func textBox(_ a: Annotation) -> NSRect {
+    let font = NSFont.systemFont(ofSize: max(12, a.fontSize), weight: .regular)
+    let size = (a.text as NSString).size(withAttributes: [.font: font])
+    let pad: CGFloat = 4
+    return NSRect(x: a.points[0].x, y: a.points[0].y - size.height - pad * 2,
+                  width: size.width + pad * 2, height: size.height + pad * 2)
+  }
+
+  private func textHit(_ p: NSPoint) -> Int? {
+    for (i, a) in annotations.enumerated().reversed() where a.tool == .text {
+      if textBox(a).contains(p) { return i }
+    }
+    return nil
+  }
+
+  private var textLineHeight: CGFloat {
+    let f = NSFont.systemFont(ofSize: max(12, fontSize), weight: .regular)
+    return ceil(f.ascender - f.descender + f.leading)
+  }
+
+  private func beginTextEditing(at p: NSPoint) {
+    finishTextEditing(commit: true)
+    let h = textLineHeight + 8
+    let tv = NSTextView(frame: NSRect(x: p.x, y: p.y - h, width: 90, height: h))
+    tv.delegate = self
+    tv.isRichText = false
+    tv.drawsBackground = textFill != nil
+    tv.backgroundColor = textFill ?? .clear
+    tv.textColor = textColor
+    tv.font = NSFont.systemFont(ofSize: max(12, fontSize), weight: .regular)
+    tv.textContainerInset = NSSize(width: 4, height: 4)
+    tv.textContainer?.lineFragmentPadding = 0
+    tv.isVerticallyResizable = false
+    tv.isHorizontallyResizable = true
+    tv.autoresizingMask = []
+    tv.insertionPointColor = textColor
+    tv.wantsLayer = true
+    tv.layer?.borderWidth = 1
+    tv.layer?.borderColor = textColor.withAlphaComponent(0.9).cgColor
+    tv.layer?.cornerRadius = 2
+    editingAnchor = p
+    addSubview(tv)
+    textEditor = tv
+    window?.makeFirstResponder(tv)
+    needsDisplay = true
+  }
+
+  private func layoutTextEditor() {
+    guard let tv = textEditor else { return }
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: tv.font ?? NSFont.systemFont(ofSize: max(12, fontSize)),
+    ]
+    let size = (tv.string as NSString).size(withAttributes: attrs)
+    let w = max(90, size.width + 10)
+    tv.setFrameSize(NSSize(width: w, height: textLineHeight + 8))
+  }
+
+  func finishTextEditing(commit: Bool) {
+    guard let tv = textEditor else { return }
+    let str = tv.string
+    tv.removeFromSuperview()
+    textEditor = nil
+    if commit, !str.isEmpty {
+      var a = Annotation(
+        tool: .text, points: [editingAnchor, editingAnchor],
+        color: textColor, width: 1, filled: false, outline: false)
+      a.text = str
+      a.fontSize = fontSize
+      a.fillColor = textFill
+      annotations.append(a)
+      redoStack.removeAll()
+    }
+    window?.makeFirstResponder(self)
+    needsDisplay = true
+  }
+
+  private func sbRectOf(_ i: Int) -> NSRect {
+    secondaryBar()?.items[i] ?? .zero
+  }
+
+  private func drawSizeEditor() {
+    let r = sizeEditorRect()
+    NSColor(white: 0.13, alpha: 0.98).setFill()
+    NSBezierPath(roundedRect: r, xRadius: 8, yRadius: 8).fill()
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+      .foregroundColor: NSColor(white: 0.9, alpha: 1),
+    ]
+    ("宽" as NSString).draw(
+      at: NSPoint(x: r.minX + 10, y: r.midY - 7), withAttributes: attrs)
+    ("高" as NSString).draw(
+      at: NSPoint(x: r.minX + 92, y: r.midY - 7), withAttributes: attrs)
+
+    let c = sizeConfirmRect()
+    NSColor(white: 0.30, alpha: 1).setFill()
+    NSBezierPath(roundedRect: c, xRadius: 5, yRadius: 5).fill()
+    let t = "确认" as NSString
+    let ts = t.size(withAttributes: attrs)
+    t.draw(at: NSPoint(x: c.midX - ts.width / 2, y: c.midY - ts.height / 2), withAttributes: attrs)
+  }
+
+  private func drawInfoBar() {
+    let bar = infoBar()
+    NSColor(white: 0.13, alpha: 0.94).setFill()
+    NSBezierPath(roundedRect: bar, xRadius: 8, yRadius: 8).fill()
+
+    let attrs: [NSAttributedString.Key: Any] = [
+      .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+      .foregroundColor: NSColor(white: 0.95, alpha: 1),
+    ]
+    let text = "\(Int(sel.width)) × \(Int(sel.height))" as NSString
+    let ts = text.size(withAttributes: attrs)
+    text.draw(
+      at: NSPoint(x: bar.minX + 10, y: bar.midY - ts.height / 2), withAttributes: attrs)
+
+    // 圆角滑杆
+    let sl = infoSliderRect()
+    NSColor(white: 0.45, alpha: 1).setFill()
+    NSBezierPath(roundedRect: NSRect(
+      x: sl.minX, y: sl.midY - 1, width: sl.width, height: 2), xRadius: 1, yRadius: 1).fill()
+    let t = max(0, min(1, cornerRadius / 100))
+    NSColor(white: 0.95, alpha: 1).setFill()
+    NSBezierPath(ovalIn: NSRect(
+      x: sl.minX + sl.width * t - 5, y: sl.midY - 5, width: 10, height: 10)).fill()
+
+    let val = "\(Int(cornerRadius))" as NSString
+    let vs = val.size(withAttributes: attrs)
+    val.draw(
+      at: NSPoint(x: infoValueRect().midX - vs.width / 2, y: bar.midY - vs.height / 2),
+      withAttributes: attrs)
+  }
+
+  private func applyRadius(_ p: NSPoint) {
+    let r = infoSliderRect()
+    let t = max(0, min(1, (p.x - r.minX) / max(r.width, 1)))
+    cornerRadius = (t * 100).rounded()
+    needsDisplay = true
+  }
+
+  private func applyFontSize(_ p: NSPoint) {
+    guard let sb = secondaryBar(), sb.items.count > 2 else { return }
+    let r = sb.items[2]
+    let t = max(0, min(1, (p.x - r.minX) / max(r.width, 1)))
+    fontSize = max(12, min(120, (12 + t * 108).rounded()))
+    needsDisplay = true
   }
 
   private func applyMosaicSlider(_ p: NSPoint) {
@@ -1777,8 +2211,22 @@ final class SelectionView: NSView {
       if customDrag == .sv { applySV(p) } else { applyHue(p) }
       return
     }
+    if radiusDrag {
+      applyRadius(p)
+      return
+    }
+    if let idx = textDragIndex {
+      let dx = p.x - textDragStart.x
+      let dy = p.y - textDragStart.y
+      annotations[idx].points[0] = NSPoint(
+        x: textDragOrigin.x + dx, y: textDragOrigin.y + dy)
+      needsDisplay = true
+      return
+    }
     if sliderDrag {
-      if primary == .mosaic { applyMosaicSlider(p) } else { applySlider(p) }
+      if primary == .mosaic { applyMosaicSlider(p) }
+      else if primary == .text { applyFontSize(p) }
+      else { applySlider(p) }
       return
     }
     if var d = draft {
@@ -1821,6 +2269,8 @@ final class SelectionView: NSView {
   override func mouseUp(with event: NSEvent) {
     customDrag = .none
     sliderDrag = false
+    textDragIndex = nil
+    radiusDrag = false
     if let d = draft {
       if d.tool == .pen || d.tool == .mosaicBrush {
         if d.points.count > 1 { annotations.append(d); redoStack.removeAll() }
@@ -1956,7 +2406,6 @@ final class SelectionView: NSView {
   // MARK: 底图（打开截图时先截好的整屏图）
 
   private var screenImage: NSImage?
-  private var markedFirstDraw = false
 
   func setBaseImage(_ img: NSImage?) {
     screenImage = img
@@ -2007,7 +2456,7 @@ final class SelectionView: NSView {
     guard sel.width > 4, sel.height > 4 else { setTip(nil, .zero); return }
     let pb = primaryBar()
     for (i, r) in pb.tools.enumerated() where r.insetBy(dx: -2, dy: -2).contains(p) {
-      setTip(["形状", "箭头", "画笔", "文字（未实现）", "马赛克"][i], r)
+      setTip(["形状", "箭头", "画笔", "文字", "马赛克"][i], r)
       return
     }
     for (i, r) in pb.actions.enumerated() where r.insetBy(dx: -2, dy: -2).contains(p) {
@@ -2020,9 +2469,11 @@ final class SelectionView: NSView {
       if let idx = sb.items.firstIndex(where: { $0.insetBy(dx: -2, dy: -2).contains(p) }) {
         let shapeNames = ["矩形", "圆形", "画线", "外框", "粗细", "填充"]
         let mosaicNames = ["马赛克", "模糊", "涂抹（点击选粗细）", "框选", mosaicBlur ? "模糊半径" : "像素大小"]
+        let textNames = ["字色", "填充", "字号"]
         var name = "粗细"
         if primary == .shape, idx < shapeNames.count { name = shapeNames[idx] }
         if primary == .mosaic, idx < mosaicNames.count { name = mosaicNames[idx] }
+        if primary == .text, idx < textNames.count { name = textNames[idx] }
         setTip(name, sb.items[idx])
         return
       }
@@ -2031,6 +2482,22 @@ final class SelectionView: NSView {
   }
 
   override func mouseExited(with event: NSEvent) { setTip(nil, .zero) }
+
+  // MARK: NSTextViewDelegate
+
+  func textDidChange(_ notification: Notification) { layoutTextEditor() }
+
+  func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+    if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+      finishTextEditing(commit: true)
+      return true
+    }
+    if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+      finishTextEditing(commit: false)
+      return true
+    }
+    return false
+  }
 
   private func updateCursor(_ p: NSPoint) {
     updateTip(p)
@@ -2062,11 +2529,23 @@ final class SelectionView: NSView {
       }
       return
     }
+    if tool == .text, textHit(p) != nil { NSCursor.openHand.set(); return }
     if !selLocked, sel.contains(p) { NSCursor.openHand.set(); return }
     NSCursor.crosshair.set()
   }
 
   override func keyDown(with event: NSEvent) {
+    // 宽高面板开着时，回车 / Esc 只作用于面板，绝不能穿透去确认或取消截图
+    if showSizeEditor {
+      if event.keyCode == 36 || event.keyCode == 76 {
+        applySizeEditor()
+        return
+      }
+      if event.keyCode == 53 {
+        closeSizeEditor()
+        return
+      }
+    }
     let scale = max(window?.backingScaleFactor ?? 1, 1)
     let step = (event.modifierFlags.contains(.shift) ? 1.0 : 5.0) / scale
     if event.modifierFlags.contains(.command), event.keyCode == 6 {
@@ -2104,16 +2583,12 @@ final class SelectionView: NSView {
   override func cancelOperation(_ sender: Any?) { onCancel?() }
 
   override func draw(_ dirtyRect: NSRect) {
-    if !markedFirstDraw {
-      markedFirstDraw = true
-      ScreenshotOverlay.openMark("first draw")
-    }
     // 底图整画一次，再用"整屏减去选区"的遮罩压暗，天然对齐
     if let img = screenImage {
       img.draw(in: bounds)
       if sel.width > 4, sel.height > 4 {
         let mask = NSBezierPath(rect: bounds)
-        mask.append(NSBezierPath(rect: sel))
+        mask.append(innerShape())
         mask.windingRule = .evenOdd
         NSColor.black.withAlphaComponent(0.45).setFill()
         mask.fill()
@@ -2139,7 +2614,7 @@ final class SelectionView: NSView {
       }
     } else {
       NSGraphicsContext.saveGraphicsState()
-      NSBezierPath(rect: sel).addClip()
+      innerShape().addClip()
       for a in annotations {
         if a.tool.isMosaic { drawMosaicPreview(a) } else { drawAnnotation(a) }
       }
@@ -2162,29 +2637,16 @@ final class SelectionView: NSView {
       }
 
       NSColor.white.setStroke()
-      let border = NSBezierPath(rect: sel)
+      let border = innerShape()
       border.lineWidth = 1
       border.stroke()
       NSColor.white.setFill()
       if !selLocked { for hnd in handles() { hnd.fill() } }
 
-      let label = "\(Int(sel.width)) × \(Int(sel.height))"
-      let attrs: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-        .foregroundColor: NSColor.white,
-      ]
-      let size = (label as NSString).size(withAttributes: attrs)
-      var lx = sel.midX - size.width / 2
-      var ly = sel.maxY + 6
-      if ly + size.height > bounds.maxY { ly = sel.minY - size.height - 6 }
-      lx = min(max(lx, bounds.minX + 4), bounds.maxX - size.width - 4)
-      if ly < bounds.minY { ly = bounds.minY + 4 }
-      let box = NSRect(x: lx - 6, y: ly - 2, width: size.width + 12, height: size.height + 4)
-      NSColor.black.withAlphaComponent(0.6).setFill()
-      NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill()
-      (label as NSString).draw(at: NSPoint(x: lx, y: ly), withAttributes: attrs)
+      drawInfoBar()
 
       drawBars()
+      if showSizeEditor { drawSizeEditor() }
 
       if let tip = tipText {
         let attrs: [NSAttributedString.Key: Any] = [
@@ -2399,14 +2861,14 @@ final class SelectionView: NSView {
         fillGlyph(Self.arrowGlyph, in: r.insetBy(dx: 7.2, dy: 8.2), white)
       case 2:  // 画笔（SVG）
         fillGlyph(Self.penGlyph, in: r.insetBy(dx: 6.7, dy: 6.7), white)
-      case 3:  // 文字（暂未实现，淡显）
+      case 3:  // 文字
         let a = NSBezierPath()
         a.move(to: NSPoint(x: mid.x - 6, y: mid.y - 6.5))
         a.line(to: NSPoint(x: mid.x, y: mid.y + 6.5))
         a.line(to: NSPoint(x: mid.x + 6, y: mid.y - 6.5))
         a.move(to: NSPoint(x: mid.x - 3.1, y: mid.y - 1))
         a.line(to: NSPoint(x: mid.x + 3.1, y: mid.y - 1))
-        NSColor(white: 0.5, alpha: 1).setStroke()
+        white.setStroke()
         a.lineWidth = 1.6
         a.lineCapStyle = .round
         a.lineJoinStyle = .round
@@ -2539,6 +3001,40 @@ final class SelectionView: NSView {
         NSRect(x: sepX, y: sb.bg.midY - 9, width: 1, height: 18).fill()
         drawSlider(sb.items[4], ratio: (mosaicBlock - 1) / 9)
         drawWidthValue(sb.value, value: mosaicBlock)
+      } else if primary == .text {
+        // 字色：彩色 A
+        let r0 = sb.items[0]
+        let aAttrs: [NSAttributedString.Key: Any] = [
+          .font: NSFont.systemFont(ofSize: 17, weight: .semibold),
+          .foregroundColor: textColor,
+        ]
+        let asz = ("A" as NSString).size(withAttributes: aAttrs)
+        ("A" as NSString).draw(
+          at: NSPoint(x: r0.midX - asz.width / 2, y: r0.midY - asz.height / 2),
+          withAttributes: aAttrs)
+
+        // 填充：色块 / 取消填充（红斜线）
+        let r1 = sb.items[1]
+        let block = NSRect(x: r1.midX - 7, y: r1.midY - 6, width: 14, height: 12)
+        if let f = textFill {
+          f.setFill()
+          NSBezierPath(roundedRect: block, xRadius: 2, yRadius: 2).fill()
+        }
+        NSColor.white.withAlphaComponent(0.55).setStroke()
+        let br = NSBezierPath(roundedRect: block, xRadius: 2, yRadius: 2)
+        br.lineWidth = 1
+        br.stroke()
+        if textFill == nil {
+          NSColor(red: 1.0, green: 0.32, blue: 0.28, alpha: 1).setStroke()
+          let slash = NSBezierPath()
+          slash.move(to: NSPoint(x: block.maxX, y: block.maxY))
+          slash.line(to: NSPoint(x: block.minX, y: block.minY))
+          slash.lineWidth = 1.8
+          slash.lineCapStyle = .round
+          slash.stroke()
+        }
+        drawSlider(sb.items[2], ratio: (fontSize - 12) / 108)
+        drawWidthValue(sb.value, value: fontSize)
       } else if let slider = sb.items.first {
         drawSlider(slider)
         drawWidthValue(sb.value)
@@ -2630,7 +3126,7 @@ final class SelectionView: NSView {
 
         // 预览 + 色值
         let chip = customChip()
-        color.setFill()
+        activeColor.setFill()
         NSBezierPath(roundedRect: chip, xRadius: 4, yRadius: 4).fill()
         NSColor.white.withAlphaComponent(0.7).setStroke()
         let chipRing = NSBezierPath(roundedRect: chip, xRadius: 4, yRadius: 4)
@@ -2651,17 +3147,9 @@ final class SelectionView: NSView {
         NSColor(white: 0.14, alpha: 0.98).setFill()
         NSBezierPath(roundedRect: pr, xRadius: 8, yRadius: 8).fill()
         let cells = paletteCells()
+        let customIndex = paletteCount - 1
         for (i, r) in cells.enumerated() {
-          if i < presets.count {
-            presets[i].setFill()
-            NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
-            if presets[i] == color {
-              NSColor.white.setStroke()
-              let ring = NSBezierPath(roundedRect: r.insetBy(dx: -2, dy: -2), xRadius: 5, yRadius: 5)
-              ring.lineWidth = 1.5
-              ring.stroke()
-            }
-          } else {
+          if i == customIndex {
             let rainbow = (0...6).map {
               NSColor(hue: CGFloat($0) / 6, saturation: 0.9, brightness: 1, alpha: 1)
             }
@@ -2671,6 +3159,35 @@ final class SelectionView: NSView {
             let ring = NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4)
             ring.lineWidth = showCustom ? 1.5 : 1
             ring.stroke()
+            continue
+          }
+          if paletteTarget == .fill && i == 0 {
+            // 取消填充：方块 + 右上到左下的红线
+            NSColor(white: 0.30, alpha: 1).setFill()
+            NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
+            NSColor.white.withAlphaComponent(0.55).setStroke()
+            let ring = NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4)
+            ring.lineWidth = 1
+            ring.stroke()
+            NSColor(red: 1.0, green: 0.32, blue: 0.28, alpha: 1).setStroke()
+            let both = NSBezierPath()
+            both.move(to: NSPoint(x: r.maxX - 3, y: r.maxY - 3))
+            both.line(to: NSPoint(x: r.minX + 3, y: r.minY + 3))
+            both.lineWidth = 2
+            both.lineCapStyle = .round
+            both.stroke()
+            continue
+          }
+          let idx = paletteTarget == .fill ? i - 1 : i
+          if idx >= 0 && idx < presets.count {
+            presets[idx].setFill()
+            NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4).fill()
+            if presets[idx] == activeColor {
+              NSColor.white.setStroke()
+              let ring = NSBezierPath(roundedRect: r.insetBy(dx: -2, dy: -2), xRadius: 5, yRadius: 5)
+              ring.lineWidth = 1.5
+              ring.stroke()
+            }
           }
         }
       }
