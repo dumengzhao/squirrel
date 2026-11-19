@@ -356,6 +356,29 @@
           }
         }
       }
+    },
+    "Switch to Traditional" : {
+      "comment" : "Menu item",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Traditional Chinese"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "切换至繁体输入"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "切換至繁體輸入"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

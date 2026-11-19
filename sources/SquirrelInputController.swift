@@ -723,6 +723,11 @@ final class SquirrelInputController: IMKInputController {
     let symbols = NSMenuItem(title: NSLocalizedString("Symbols", comment: "Menu item"),
                              action: #selector(openSymbols), keyEquivalent: "")
     symbols.target = self
+    let tradItem = NSMenuItem(title: NSLocalizedString("Switch to Traditional", comment: "Menu item"),
+                              action: #selector(toggleTraditional), keyEquivalent: "")
+    tradItem.target = self
+    // rime-ice 的简繁开关是 traditionalization（开 = 繁体）。勾选表示"当前是繁体"
+    tradItem.state = hengGetOption(session, "traditionalization") ? .on : .off
     let vkbdItem = NSMenuItem(title: NSLocalizedString("Virtual Keyboard", comment: "Menu item"),
                               action: #selector(toggleVkbd), keyEquivalent: "")
     vkbdItem.target = self
@@ -740,12 +745,14 @@ final class SquirrelInputController: IMKInputController {
                             action: #selector(checkForUpdates), keyEquivalent: "")
     update.target = self
 
-    // 分组：设置 | 表情/符号 | 软键盘 | 截图 | 关于/检查更新
+    // 分组：设置 | 表情/符号 | 繁体 | 软键盘 | 截图 | 关于/检查更新
     let menu = NSMenu()
     menu.addItem(setting)
     menu.addItem(.separator())
     menu.addItem(emoji)
     menu.addItem(symbols)
+    menu.addItem(.separator())
+    menu.addItem(tradItem)
     menu.addItem(.separator())
     menu.addItem(vkbdItem)
     menu.addItem(.separator())
@@ -767,6 +774,12 @@ final class SquirrelInputController: IMKInputController {
 
   @objc func openSymbols() {
     _ = heng_symbols_show()
+  }
+
+  /// 简繁切换：翻转 rime-ice 的 traditionalization 开关（core 负责持久化）
+  @objc func toggleTraditional() {
+    guard session != 0 else { return }
+    hengSetOption(session, "traditionalization", !hengGetOption(session, "traditionalization"))
   }
 
   @objc func toggleVkbd() {
