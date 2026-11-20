@@ -1229,8 +1229,17 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
   var onSave: ((NSRect, SelectionView) -> Void)?
 
   private(set) var annotations: [Annotation] = []
-  private var redoStack: [Annotation] = []
+  /// 快照式撤销：每次修改前压一份 annotations，移动/删除/编辑都能回退
+  private var undoStack: [[Annotation]] = []
+  private var redoStack: [[Annotation]] = []
   private var draft: Annotation?
+
+  // 注释选中与拖动
+  private var selectedIndex: Int? = nil
+  private var annDragIndex: Int? = nil
+  private var annDragStart: NSPoint = .zero
+  private var annDragOrigins: [NSPoint] = []
+  private var annDragMoved = false
 
   // 工具状态
   private enum Primary: Int { case shape, arrow, pen, text, mosaic }
@@ -1259,10 +1268,9 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
   private var sizeHField: NSTextField?
 
   private var textEditor: NSTextView?
-  private var textDragIndex: Int?
-  private var textDragStart: NSPoint = .zero
-  private var textDragOrigin: NSPoint = .zero
   private var editingAnchor: NSPoint = .zero
+  /// 二次编辑时指向被改的那条注释；nil = 新建
+  private var editingExistingIndex: Int? = nil
   private var editingText = ""
 
   private var showPalette = false
@@ -1725,16 +1733,24 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
         return
       }
 
+      // 点中已有注释：选中并可拖动（双击文字进二次编辑）
+      // 画笔 / 涂抹是连续落笔，不参与选中，否则在已有图形上就画不下去
+      let freehand = (tool == .pen || tool == .mosaicBrush)
+      if !freehand, let hit = annotationHit(p) {
+        if event.clickCount >= 2, annotations[hit].tool == .text {
+          editExistingText(hit)
+        } else {
+          beginAnnotationDrag(hit, at: p)
+          NSCursor.closedHand.set()
+        }
+        return
+      }
+      // 点空白：取消选中，继续走绘制流程
+      if selectedIndex != nil { selectedIndex = nil; needsDisplay = true }
+
       if let t = tool, sel.contains(p) {
         if t == .text {
-          if let idx = textHit(p) {
-            textDragIndex = idx
-            textDragStart = p
-            textDragOrigin = annotations[idx].points[0]
-            NSCursor.closedHand.set()
-          } else {
-            beginTextEditing(at: p)
-          }
+          beginTextEditing(at: p)
           return
         }
         var a = Annotation(
@@ -2034,6 +2050,80 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     return false
   }
 
+  // MARK: 注释选中与拖动
+
+  /// 可选中、可拖动的类型。画笔和马赛克涂抹不参与，否则落笔会被"选中"抢走
+  private func isSelectable(_ a: Annotation) -> Bool {
+    switch a.tool {
+    case .rect, .ellipse, .line, .arrow, .text, .mosaicRect: return true
+    default: return false
+    }
+  }
+
+  private func annotationBounds(_ a: Annotation) -> NSRect {
+    if a.tool == .text { return textBox(a) }
+    guard a.points.count >= 2 else { return .zero }
+    let p0 = a.points[0], p1 = a.points[1]
+    let r = NSRect(
+      x: min(p0.x, p1.x), y: min(p0.y, p1.y),
+      width: abs(p1.x - p0.x), height: abs(p1.y - p0.y))
+    // 描边和箭头头部会溢出包围盒，外扩一点更好点中
+    let pad = max(a.width, 3) / 2 + 3
+    return r.insetBy(dx: -pad, dy: -pad)
+  }
+
+  private func distanceToSegment(_ p: NSPoint, _ a: NSPoint, _ b: NSPoint) -> CGFloat {
+    let dx = b.x - a.x, dy = b.y - a.y
+    let len2 = dx * dx + dy * dy
+    guard len2 > 0.0001 else { return hypot(p.x - a.x, p.y - a.y) }
+    let t = max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2))
+    return hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy))
+  }
+
+  /// 命中测试（后画的优先）
+  private func annotationHit(_ p: NSPoint) -> Int? {
+    for (i, a) in annotations.enumerated().reversed() where isSelectable(a) {
+      switch a.tool {
+      case .line, .arrow:
+        guard a.points.count >= 2 else { continue }
+        if distanceToSegment(p, a.points[0], a.points[1]) <= max(6, a.width) { return i }
+      case .text:
+        if textBox(a).contains(p) { return i }
+      default:
+        if annotationBounds(a).contains(p) { return i }
+      }
+    }
+    return nil
+  }
+
+  private func beginAnnotationDrag(_ i: Int, at p: NSPoint) {
+    selectedIndex = i
+    annDragIndex = i
+    annDragStart = p
+    annDragOrigins = annotations[i].points
+    annDragMoved = false
+    needsDisplay = true
+  }
+
+  private func deleteSelectedAnnotation() {
+    guard let i = selectedIndex, annotations.indices.contains(i) else { return }
+    pushUndo()
+    annotations.remove(at: i)
+    selectedIndex = nil
+    needsDisplay = true
+  }
+
+  private func drawSelectionIndicator() {
+    guard editingExistingIndex == nil else { return }
+    guard let i = selectedIndex, annotations.indices.contains(i) else { return }
+    let b = annotationBounds(annotations[i]).insetBy(dx: -3, dy: -3)
+    NSColor(red: 0.29, green: 0.56, blue: 1.0, alpha: 1).setStroke()
+    let path = NSBezierPath(rect: b)
+    path.lineWidth = 1.5
+    path.setLineDash([4, 3], count: 2, phase: 0)
+    path.stroke()
+  }
+
   // MARK: 文字编辑
 
   /// 文字的包围盒（填充块同尺寸）
@@ -2045,20 +2135,17 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
                   width: size.width + pad * 2, height: size.height + pad * 2)
   }
 
-  private func textHit(_ p: NSPoint) -> Int? {
-    for (i, a) in annotations.enumerated().reversed() where a.tool == .text {
-      if textBox(a).contains(p) { return i }
-    }
-    return nil
-  }
-
   private var textLineHeight: CGFloat {
     let f = NSFont.systemFont(ofSize: max(12, fontSize), weight: .regular)
     return ceil(f.ascender - f.descender + f.leading)
   }
 
-  private func beginTextEditing(at p: NSPoint) {
+  private func beginTextEditing(
+    at p: NSPoint, replacing index: Int? = nil, initial: String = ""
+  ) {
     finishTextEditing(commit: true)
+    editingExistingIndex = index
+    selectedIndex = nil
     let h = textLineHeight + 8
     let tv = NSTextView(frame: NSRect(x: p.x, y: p.y - h, width: 90, height: h))
     tv.delegate = self
@@ -2080,8 +2167,23 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     editingAnchor = p
     addSubview(tv)
     textEditor = tv
+    if !initial.isEmpty {
+      tv.string = initial
+      layoutTextEditor()
+      tv.setSelectedRange(NSRange(location: (initial as NSString).length, length: 0))
+    }
     window?.makeFirstResponder(tv)
     needsDisplay = true
+  }
+
+  /// 双击已有文字：用它自己的样式重新进编辑
+  private func editExistingText(_ i: Int) {
+    guard annotations.indices.contains(i) else { return }
+    let a = annotations[i]
+    textColor = a.color
+    fontSize = a.fontSize
+    textFill = a.fillColor
+    beginTextEditing(at: a.points[0], replacing: i, initial: a.text)
   }
 
   private func layoutTextEditor() {
@@ -2099,15 +2201,31 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     let str = tv.string
     tv.removeFromSuperview()
     textEditor = nil
-    if commit, !str.isEmpty {
-      var a = Annotation(
-        tool: .text, points: [editingAnchor, editingAnchor],
-        color: textColor, width: 1, filled: false, outline: false)
-      a.text = str
-      a.fontSize = fontSize
-      a.fillColor = textFill
-      annotations.append(a)
-      redoStack.removeAll()
+    let existing = editingExistingIndex
+    editingExistingIndex = nil
+    if commit {
+      if !str.isEmpty {
+        var a = Annotation(
+          tool: .text, points: [editingAnchor, editingAnchor],
+          color: textColor, width: 1, filled: false, outline: false)
+        a.text = str
+        a.fontSize = fontSize
+        a.fillColor = textFill
+        pushUndo()
+        if let i = existing, annotations.indices.contains(i) {
+          a.points = [annotations[i].points[0], annotations[i].points[0]]
+          annotations[i] = a
+          selectedIndex = i
+        } else {
+          annotations.append(a)
+          selectedIndex = annotations.count - 1
+        }
+      } else if let i = existing, annotations.indices.contains(i) {
+        // 把文字改空了 = 删除这条
+        pushUndo()
+        annotations.remove(at: i)
+        selectedIndex = nil
+      }
     }
     window?.makeFirstResponder(self)
     needsDisplay = true
@@ -2199,9 +2317,26 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     needsDisplay = true
   }
 
+  /// 修改注释前调用：压一份快照并清空重做栈
+  private func pushUndo() {
+    undoStack.append(annotations)
+    if undoStack.count > 40 { undoStack.removeFirst() }
+    redoStack.removeAll()
+  }
+
   private func undo() {
-    guard let last = annotations.popLast() else { NSSound.beep(); return }
-    redoStack.append(last)
+    guard let prev = undoStack.popLast() else { NSSound.beep(); return }
+    redoStack.append(annotations)
+    annotations = prev
+    selectedIndex = nil
+    needsDisplay = true
+  }
+
+  private func redo() {
+    guard let next = redoStack.popLast() else { return }
+    undoStack.append(annotations)
+    annotations = next
+    selectedIndex = nil
     needsDisplay = true
   }
 
@@ -2215,12 +2350,20 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
       applyRadius(p)
       return
     }
-    if let idx = textDragIndex {
-      let dx = p.x - textDragStart.x
-      let dy = p.y - textDragStart.y
-      annotations[idx].points[0] = NSPoint(
-        x: textDragOrigin.x + dx, y: textDragOrigin.y + dy)
-      needsDisplay = true
+    if let i = annDragIndex, annotations.indices.contains(i) {
+      let dx = p.x - annDragStart.x
+      let dy = p.y - annDragStart.y
+      // 真的动了才记一步撤销，避免"点一下"也占一格
+      if !annDragMoved, abs(dx) + abs(dy) > 1 {
+        annDragMoved = true
+        pushUndo()
+      }
+      if annDragMoved {
+        annotations[i].points = annDragOrigins.map {
+          NSPoint(x: $0.x + dx, y: $0.y + dy)
+        }
+        needsDisplay = true
+      }
       return
     }
     if sliderDrag {
@@ -2269,14 +2412,14 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
   override func mouseUp(with event: NSEvent) {
     customDrag = .none
     sliderDrag = false
-    textDragIndex = nil
+    annDragIndex = nil
     radiusDrag = false
     if let d = draft {
       if d.tool == .pen || d.tool == .mosaicBrush {
-        if d.points.count > 1 { annotations.append(d); redoStack.removeAll() }
+        if d.points.count > 1 { pushUndo(); annotations.append(d) }
       } else if abs(d.points[1].x - d.points[0].x) > 2 || abs(d.points[1].y - d.points[0].y) > 2 {
+        pushUndo()
         annotations.append(d)
-        redoStack.removeAll()
       }
       draft = nil
       needsDisplay = true
@@ -2515,6 +2658,7 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
       NSCursor.pointingHand.set()
       return
     }
+    if annotationHit(p) != nil { NSCursor.openHand.set(); return }
     if tool != nil { NSCursor.crosshair.set(); return }
     if !selLocked,
        let idx = handles().enumerated().first(where: {
@@ -2529,7 +2673,6 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
       }
       return
     }
-    if tool == .text, textHit(p) != nil { NSCursor.openHand.set(); return }
     if !selLocked, sel.contains(p) { NSCursor.openHand.set(); return }
     NSCursor.crosshair.set()
   }
@@ -2549,13 +2692,25 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     let scale = max(window?.backingScaleFactor ?? 1, 1)
     let step = (event.modifierFlags.contains(.shift) ? 1.0 : 5.0) / scale
     if event.modifierFlags.contains(.command), event.keyCode == 6 {
-      if event.modifierFlags.contains(.shift) {
-        if let last = redoStack.popLast() { annotations.append(last) }
-      } else if let last = annotations.popLast() {
-        redoStack.append(last)
-      }
-      needsDisplay = true
+      if event.modifierFlags.contains(.shift) { redo() } else { undo() }
       return
+    }
+    // 选中注释时：方向键微调、⌫/⌦ 删除
+    if let i = selectedIndex, annotations.indices.contains(i) {
+      if [123, 124, 125, 126].contains(event.keyCode) {
+        let dx: CGFloat = event.keyCode == 123 ? -step : (event.keyCode == 124 ? step : 0)
+        let dy: CGFloat = event.keyCode == 125 ? -step : (event.keyCode == 126 ? step : 0)
+        pushUndo()
+        annotations[i].points = annotations[i].points.map {
+          NSPoint(x: $0.x + dx, y: $0.y + dy)
+        }
+        needsDisplay = true
+        return
+      }
+      if event.keyCode == 51 || event.keyCode == 117 {
+        deleteSelectedAnnotation()
+        return
+      }
     }
     switch event.keyCode {
     case 123:
@@ -2571,7 +2726,8 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
       guard !selLocked, sel.height > step else { return }
       sel.origin.y += step; sel.size.height -= step; needsDisplay = true
     case 53:
-      if showCustom { showCustom = false; needsDisplay = true }
+      if selectedIndex != nil { selectedIndex = nil; needsDisplay = true }
+      else if showCustom { showCustom = false; needsDisplay = true }
       else if showPalette { showPalette = false; needsDisplay = true }
       else if primary != nil { primary = nil; tool = nil; needsDisplay = true }
       else { onCancel?() }
@@ -2615,12 +2771,13 @@ final class SelectionView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     } else {
       NSGraphicsContext.saveGraphicsState()
       innerShape().addClip()
-      for a in annotations {
+      for (i, a) in annotations.enumerated() where editingExistingIndex != i {
         if a.tool.isMosaic { drawMosaicPreview(a) } else { drawAnnotation(a) }
       }
       if let d = draft {
         if d.tool.isMosaic { drawMosaicPreview(d) } else { drawAnnotation(d) }
       }
+      drawSelectionIndicator()
       NSGraphicsContext.restoreGraphicsState()
 
       // 框选马赛克：拖动时给个蓝框提示，松手就没了
